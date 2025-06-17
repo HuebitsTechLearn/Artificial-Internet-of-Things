@@ -1,0 +1,380 @@
+Conceptual Code Snippets for AI-Integrated Smart Vending Machine (Raspberry Pi)
+1. vending_machine_main.py - Main Raspberry Pi Application
+This script orchestrates the camera feed, AI inference, recommendation logic, servo control, and data logging to the cloud.
+
+Python
+
+import cv2
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import img_to_array
+import time
+import json
+import logging
+import RPi.GPIO as GPIO # For servo control
+import firebase_admin # For Firebase cloud integration
+from firebase_admin import credentials, db
+
+# --- Configure Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Firebase Configuration ---
+# IMPORTANT: Replace 'path/to/your/serviceAccountKey.json' with your actual path.
+# Get this from Firebase Project Settings -> Service Accounts -> Generate new private key
+try:
+    cred = credentials.Certificate("path/to/your/serviceAccountKey.json")
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': 'https://YOUR-FIREBASE-PROJECT-ID.firebaseio.com' # Replace with your project URL
+    })
+    cloud_db_ref = db.reference('/') # Root reference for Firebase
+    logging.info("Firebase initialized successfully.")
+except Exception as e:
+    logging.error(f"Error initializing Firebase: {e}")
+    # Consider handling: maybe run in offline mode or exit
+    cloud_db_ref = None # Set to None if initialization fails
+
+# --- AI Model Paths ---
+SENTIMENT_MODEL_PATH = "models/sentiment_model.tflite"
+INVENTORY_MODEL_PATH = "models/inventory_detection_model.tflite"
+
+# --- Model Input Sizes ---
+SENTIMENT_IMG_SIZE = (48, 48) # Example for facial expression models
+INVENTORY_IMG_SIZE = (320, 320) # Example for object detection models
+
+# --- Load TensorFlow Lite Interpreters ---
+try:
+    sentiment_interpreter = tf.lite.Interpreter(model_path=SENTIMENT_MODEL_PATH)
+    sentiment_interpreter.allocate_tensors()
+    sentiment_input_details = sentiment_interpreter.get_input_details()
+    sentiment_output_details = sentiment_interpreter.get_output_details()
+    logging.info(f"Sentiment model loaded. Input: {sentiment_input_details}, Output: {sentiment_output_details}")
+
+    inventory_interpreter = tf.lite.Interpreter(model_path=INVENTORY_MODEL_PATH)
+    inventory_interpreter.allocate_tensors()
+    inventory_input_details = inventory_interpreter.get_input_details()
+    inventory_output_details = inventory_interpreter.get_output_details()
+    logging.info(f"Inventory model loaded. Input: {inventory_input_details}, Output: {inventory_output_details}")
+
+except Exception as e:
+    logging.error(f"Error loading AI models: {e}")
+    exit() # Critical error, cannot proceed without models
+
+# --- Face Detection (Pre-trained OpenCV Haar Cascade for simplicity) ---
+FACE_CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
+if face_cascade.empty():
+    logging.error("Could not load Haar cascade for face detection.")
+    exit()
+
+# --- Servo Control Setup (Conceptual) ---
+SERVO_PIN = 17 # GPIO pin connected to servo motor
+GPIO.setmode(GPIO.BCM) # Use BCM numbering
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+pwm = GPIO.PWM(SERVO_PIN, 50) # 50 Hz PWM frequency
+pwm.start(0) # Start PWM with 0 duty cycle
+
+def set_servo_angle(angle):
+    """Sets the servo to a specific angle (0-180 degrees)."""
+    # Angle to duty cycle conversion (adjust these values based on your servo)
+    # Typically 2.5 for 0 degrees, 12.5 for 180 degrees
+    duty = (angle / 18) + 2.5
+    pwm.ChangeDutyCycle(duty)
+    time.sleep(0.5) # Allow time for servo to move
+    # pwm.ChangeDutyCycle(0) # Optional: stop sending PWM signal to save power/prevent jitter
+
+# --- Product Data (Example) ---
+PRODUCTS = {
+    "P001": {"name": "Cola", "price": 1.50, "slot": 1},
+    "P002": {"name": "Chips", "price": 1.00, "slot": 2},
+    "P003": {"name": "Water", "price": 1.25, "slot": 3},
+    "P004": {"name": "Chocolate Bar", "price": 1.75, "slot": 4}
+}
+PRODUCT_SLOTS = {
+    1: {"id": "P001", "stock": 10},
+    2: {"id": "P002", "stock": 8},
+    3: {"id": "P003", "stock": 12},
+    4: {"id": "P004", "stock": 5}
+} # Current stock, updated by inventory recognition
+
+# --- Sentiment Mapping (Example) ---
+SENTIMENT_LABELS = ['Angry', 'Disgusted', 'Fearful', 'Happy', 'Neutral', 'Sad', 'Surprised']
+SENTIMENT_RECOMMENDATIONS = {
+    'Happy': ["P001", "P003"], # Cola, Water
+    'Neutral': ["P002", "P003"], # Chips, Water
+    'Sad': ["P004"], # Chocolate Bar (comfort food)
+    'Angry': ["P003"], # Water (calming)
+    # Add more mappings
+}
+
+# --- Functions ---
+
+def analyze_sentiment(face_roi):
+    """
+    Infers sentiment from a cropped face image using the TFLite model.
+    """
+    if face_roi is None or face_roi.size == 0:
+        return "Unknown"
+
+    try:
+        # Preprocess image for sentiment model
+        face_resized = cv2.resize(face_roi, SENTIMENT_IMG_SIZE)
+        face_gray = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)
+        face_normalized = face_gray / 255.0 # Normalize to 0-1
+        
+        # TFLite models expect batch, height, width, channels
+        input_data = np.expand_dims(np.expand_dims(face_normalized, axis=0), axis=-1).astype(np.float32)
+
+        sentiment_interpreter.set_tensor(sentiment_input_details[0]['index'], input_data)
+        sentiment_interpreter.invoke()
+        predictions = sentiment_interpreter.get_tensor(sentiment_output_details[0]['index'])[0]
+        
+        sentiment_index = np.argmax(predictions)
+        sentiment = SENTIMENT_LABELS[sentiment_index]
+        return sentiment
+    except Exception as e:
+        logging.error(f"Error during sentiment analysis: {e}")
+        return "Unknown"
+
+def analyze_inventory(inventory_image):
+    """
+    Infers inventory levels from an internal image using the TFLite model.
+    Updates PRODUCT_SLOTS global variable.
+    """
+    if inventory_image is None or inventory_image.size == 0:
+        logging.warning("No inventory image to analyze.")
+        return
+
+    try:
+        # Preprocess image for inventory model
+        img_resized = cv2.resize(inventory_image, INVENTORY_IMG_SIZE)
+        img_normalized = img_resized.astype(np.float32) / 255.0
+        input_data = np.expand_dims(img_normalized, axis=0) # Add batch dimension
+
+        inventory_interpreter.set_tensor(inventory_input_details[0]['index'], input_data)
+        inventory_interpreter.invoke()
+        
+        # Assuming inventory model outputs are:
+        # detections['num_detections']
+        # detections['detection_classes']
+        # detections['detection_scores']
+        # detections['detection_boxes']
+        
+        # Placeholder for actual detection logic
+        # For a real object detection model, you'd parse outputs to get counts per product
+        
+        # Simulate inventory update:
+        # This would be based on actual detections per slot/product ID
+        for slot_num in PRODUCT_SLOTS:
+            # Simulate some stock based on a conceptual model output
+            PRODUCT_SLOTS[slot_num]['stock'] = max(0, random.randint(3, 10)) # Random stock for demo
+        
+        logging.info("Inventory updated based on image recognition.")
+        
+    except Exception as e:
+        logging.error(f"Error during inventory recognition: {e}")
+
+def get_recommendation(sentiment):
+    """
+    Provides product recommendations based on detected sentiment and current stock.
+    """
+    recommended_products = SENTIMENT_RECOMMENDATIONS.get(sentiment, [])
+    
+    available_recommendations = []
+    for p_id in recommended_products:
+        slot_num = PRODUCTS[p_id]["slot"]
+        if PRODUCT_SLOTS[slot_num]["stock"] > 0:
+            available_recommendations.append(PRODUCTS[p_id]["name"])
+            
+    if not available_recommendations:
+        # Fallback to general popular items or any available items
+        for slot_num in PRODUCT_SLOTS:
+            if PRODUCT_SLOTS[slot_num]["stock"] > 0:
+                available_recommendations.append(PRODUCTS[PRODUCT_SLOTS[slot_num]["id"]]["name"])
+                if len(available_recommendations) >= 2: # Show a couple if nothing specific
+                    break
+    
+    if available_recommendations:
+        return f"Hello! Feeling {sentiment}? Try: {', '.join(available_recommendations)}"
+    return "Welcome! Please choose a product."
+
+def dispense_product(slot_number):
+    """
+    Controls the servo to dispense a product from the given slot.
+    """
+    logging.info(f"Attempting to dispense product from slot {slot_number}")
+    if PRODUCT_SLOTS[slot_number]["stock"] > 0:
+        # Simulate servo movement
+        set_servo_angle(90) # Example angle to push out product
+        time.sleep(2)       # Allow dispensing
+        set_servo_angle(0)  # Return to home position
+        
+        PRODUCT_SLOTS[slot_number]["stock"] -= 1 # Decrement stock
+        logging.info(f"Product dispensed from slot {slot_number}. Remaining stock: {PRODUCT_SLOTS[slot_number]['stock']}")
+        log_sale_to_cloud(PRODUCT_SLOTS[slot_number]["id"])
+        return True
+    else:
+        logging.warning(f"Slot {slot_number} is empty. Cannot dispense.")
+        return False
+
+def log_sale_to_cloud(product_id):
+    """Logs a sale event to Firebase."""
+    if cloud_db_ref:
+        try:
+            sale_data = {
+                "productId": product_id,
+                "timestamp": time.time(),
+                "machineId": "VendingMachine001"
+            }
+            cloud_db_ref.child('sales').push(sale_data) # Push creates unique ID
+            logging.info(f"Sale of {product_id} logged to cloud.")
+        except Exception as e:
+            logging.error(f"Failed to log sale to cloud: {e}")
+
+def update_inventory_to_cloud():
+    """Updates current inventory levels to Firebase."""
+    if cloud_db_ref:
+        try:
+            inventory_data = {
+                "machineId": "VendingMachine001",
+                "timestamp": time.time(),
+                "slots": {}
+            }
+            for slot_num, item_data in PRODUCT_SLOTS.items():
+                inventory_data["slots"][str(slot_num)] = {
+                    "productId": item_data["id"],
+                    "stock": item_data["stock"]
+                }
+            cloud_db_ref.child('inventory').child("VendingMachine001").set(inventory_data)
+            logging.info("Inventory levels updated to cloud.")
+        except Exception as e:
+            logging.error(f"Failed to update inventory to cloud: {e}")
+
+
+# --- Main Loop ---
+def run_vending_machine():
+    cap_user = cv2.VideoCapture(0) # Camera for user sentiment
+    cap_inventory = cv2.VideoCapture(1) # Camera for internal inventory (if separate)
+
+    if not cap_user.isOpened():
+        logging.error("Failed to open user camera. Exiting.")
+        return
+    # If using two cameras, check cap_inventory as well. For simplicity, assume one camera for demo.
+    # If using a single camera, switch between modes or use a wider FOV.
+
+    # Simulate UI elements (e.g., text on console, or an actual display)
+    current_message = "Welcome! Approach for recommendations."
+    
+    last_inventory_check_time = 0
+    INVENTORY_CHECK_INTERVAL = 300 # Check inventory every 5 minutes
+
+    try:
+        while True:
+            ret_user, frame_user = cap_user.read()
+            if not ret_user:
+                logging.warning("Failed to grab user frame. Retrying...")
+                time.sleep(1)
+                continue
+
+            gray_user = cv2.cvtColor(frame_user, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray_user, 1.1, 4)
+
+            user_sentiment = "Unknown"
+            if len(faces) > 0:
+                # Assuming one main user
+                (x, y, w, h) = faces[0]
+                face_roi = frame_user[y:y+h, x:x+w]
+                user_sentiment = analyze_sentiment(face_roi)
+                current_message = get_recommendation(user_sentiment)
+                
+                # Draw bounding box on frame for debugging
+                cv2.rectangle(frame_user, (x, y), (x+w, y+h), (255, 0, 0), 2)
+            else:
+                current_message = "Welcome! Approach for recommendations." # Default if no face
+            
+            # Display message (e.g., on an LCD or console)
+            # print(f"Machine Message: {current_message}") # For console demo
+            cv2.putText(frame_user, current_message, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+
+            # --- Inventory Check ---
+            current_time = time.time()
+            if current_time - last_inventory_check_time > INVENTORY_CHECK_INTERVAL:
+                logging.info("Performing inventory check...")
+                # In a real setup, you'd capture an image of the internal inventory
+                # For demo, let's just use the user camera frame conceptually
+                ret_inv, frame_inventory = cap_user.read() # Use user cam for conceptual inventory shot
+                if ret_inv:
+                    analyze_inventory(frame_inventory)
+                    update_inventory_to_cloud()
+                last_inventory_check_time = current_time
+
+            # Simulate product selection and dispensing (e.g., via keyboard input for demo)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('1'):
+                dispense_product(1)
+            elif key == ord('2'):
+                dispense_product(2)
+            elif key == ord('q'):
+                break
+
+            # Show the user-facing camera feed (for debugging/demo)
+            cv2.imshow('Smart Vending Machine', frame_user)
+
+            time.sleep(0.1) # Small delay to manage CPU usage
+
+    except KeyboardInterrupt:
+        logging.info("Vending machine system stopping...")
+    finally:
+        cap_user.release()
+        if cap_inventory.isOpened():
+            cap_inventory.release()
+        cv2.destroyAllWindows()
+        pwm.stop()
+        GPIO.cleanup() # Clean up GPIO settings
+        logging.info("Resources released.")
+
+if __name__ == "__main__":
+    import random # For simulating data
+    run_vending_machine()
+
+2. Firebase Database Structure (Conceptual JSON)
+This is how your data might be structured in Firebase for sales and inventory.
+
+JSON
+
+{
+  "sales": {
+    "auto_generated_id_1": {
+      "productId": "P001",
+      "timestamp": 1718626000.0,
+      "machineId": "VendingMachine001",
+      "sentimentAtPurchase": "Happy" // Optional: log sentiment at sale
+    },
+    "auto_generated_id_2": {
+      "productId": "P004",
+      "timestamp": 1718626100.0,
+      "machineId": "VendingMachine001",
+      "sentimentAtPurchase": "Sad"
+    }
+  },
+  "inventory": {
+    "VendingMachine001": {
+      "timestamp": 1718626200.0,
+      "slots": {
+        "1": { "productId": "P001", "stock": 9 },
+        "2": { "productId": "P002", "stock": 8 },
+        "3": { "productId": "P003", "stock": 12 },
+        "4": { "productId": "P004", "stock": 4 }
+      }
+    }
+  },
+  "sentiment_logs": { // Optional: for trend analysis
+    "VendingMachine001": {
+      "2025-06-17": {
+        "10:05:00": { "sentiment": "Happy", "faceDetected": true },
+        "10:05:30": { "sentiment": "Neutral", "faceDetected": true },
+        "10:06:00": { "sentiment": "Unknown", "faceDetected": false }
+      }
+    }
+  }
+}
