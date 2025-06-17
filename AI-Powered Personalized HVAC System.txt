@@ -1,0 +1,333 @@
+1. ESP32 Firmware (main.ino - Arduino C++)
+This code snippet illustrates how an ESP32 would read sensor data, format it into JSON, and send it to Azure IoT Hub via MQTT. It also includes basic logic to receive commands.
+
+C++
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h> // For JSON serialization
+#include <DHT.h>         // For DHT11/DHT22 Temp/Humidity
+// #include <MHZ19_UART.h> // For MH-Z19B CO2 sensor (example)
+
+// --- WiFi Configuration ---
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// --- Azure IoT Hub Configuration ---
+// Get these from your IoT Hub device's connection string
+const char* iotHubHost = "YOUR_IOT_HUB_NAME.azure-devices.net";
+const char* deviceId = "myESP32Device"; // Needs to match registered device ID in IoT Hub
+const char* sasToken = "SharedAccessSignature sr=..."; // Generated SAS Token or primary key
+const int mqttPort = 8883;
+
+// --- MQTT Topics ---
+const char* telemetryTopic = "devices/" DEVICE_ID "/messages/events/";
+const char* commandsTopic = "devices/" DEVICE_ID "/messages/devicebound/#"; // For receiving cloud-to-device messages
+
+// --- Azure IoT Hub CA Certificate ---
+// IMPORTANT: Use the correct Azure IoT Hub CA certificate.
+// You can usually find this in Azure IoT Hub documentation or by checking the broker's cert chain.
+// This is a common Baltimore CyberTrust Root CA, but verify for your specific region/setup.
+const char* azureRootCa = \
+"-----BEGIN CERTIFICATE-----\n" \
+"MIIDdzCCAl+gAwIBAgIQEawMtN1uU6d... \n" \
+"-----END CERTIFICATE-----\n";
+
+WiFiClientSecure net;
+PubSubClient client(net);
+
+// --- Sensor Pin Definitions ---
+#define DHT_PIN 4        // Digital pin for DHT11/DHT22
+#define DHT_TYPE DHT22   // DHT11 or DHT22
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// #define CO2_RX_PIN 16 // Example pins for MH-Z19B
+// #define CO2_TX_PIN 17
+// MHZ19_UART mhz19; // MHZ19_UART(CO2_RX_PIN, CO2_TX_PIN);
+
+// --- Occupancy Sensor Pin (Example for PIR) ---
+#define OCCUPANCY_PIN 5 // Digital pin for PIR sensor
+
+// --- HVAC Control Pins (Example for Relays) ---
+#define HVAC_FAN_PIN 18     // Relay for Fan ON/OFF
+#define HVAC_COMPRESSOR_PIN 19 // Relay for Compressor ON/OFF
+#define HVAC_HEAT_PIN 21    // Relay for Heat ON/OFF
+
+// --- Timers ---
+long lastMsg = 0;
+const int PUBLISH_INTERVAL_MS = 5000; // Publish every 5 seconds
+
+// --- Function Prototypes ---
+void connectWifi();
+void connectAzureIoT();
+void messageCallback(char* topic, byte* payload, unsigned int length);
+void sendTelemetry();
+float readTemperature();
+float readHumidity();
+int readCO2();        // Placeholder
+bool readOccupancy(); // Placeholder
+void setHVACState(bool fanOn, bool compressorOn, bool heatOn);
+
+// --- Setup ---
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+
+  // GPIO setup for HVAC control
+  pinMode(HVAC_FAN_PIN, OUTPUT);
+  pinMode(HVAC_COMPRESSOR_PIN, OUTPUT);
+  pinMode(HVAC_HEAT_PIN, OUTPUT);
+  setHVACState(false, false, false); // All off initially
+
+  // GPIO setup for occupancy sensor
+  pinMode(OCCUPANCY_PIN, INPUT);
+
+  connectWifi();
+  net.setCACert(azureRootCa); // Set the root CA for secure connection
+  client.setServer(iotHubHost, mqttPort);
+  client.setCallback(messageCallback);
+
+  Serial.println("Setup Complete.");
+}
+
+// --- Loop ---
+void loop() {
+  if (!client.connected()) {
+    connectAzureIoT();
+  }
+  client.loop(); // Keep MQTT connection alive
+
+  long now = millis();
+  if (now - lastMsg > PUBLISH_INTERVAL_MS) {
+    lastMsg = now;
+    sendTelemetry();
+  }
+}
+
+// --- Function Definitions ---
+void connectWifi() {
+  Serial.printf("Connecting to WiFi %s ", ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" CONNECTED");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void connectAzureIoT() {
+  Serial.print("Attempting Azure IoT Hub MQTT connection...");
+  // Azure IoT Hub requires deviceId as username and SAS Token as password
+  if (client.connect(deviceId, iotHubHost, sasToken)) {
+    Serial.println("connected to Azure IoT Hub.");
+    // Subscribe to device-bound messages (commands from cloud)
+    client.subscribe(commandsTopic);
+  } else {
+    Serial.print("failed, rc=");
+    Serial.print(client.state());
+    Serial.println(" try again in 5 seconds");
+    delay(5000);
+  }
+}
+
+void messageCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  char message[length + 1];
+  strncpy(message, (char*)payload, length);
+  message[length] = '\0';
+  Serial.println(message);
+
+  // Parse command from cloud
+  StaticJsonDocument<200> doc;
+  DeserializationError error = deserializeJson(doc, message);
+
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.f_str());
+    return;
+  }
+
+  const char* command = doc["command"];
+  if (strcmp(command, "setHVAC") == 0) {
+    bool fan = doc["fan"];
+    bool compressor = doc["compressor"];
+    bool heat = doc["heat"];
+    setHVACState(fan, compressor, heat);
+    Serial.print("HVAC set to: Fan="); Serial.print(fan);
+    Serial.print(", Comp="); Serial.print(compressor);
+    Serial.print(", Heat="); Serial.print(heat); Serial.println();
+  }
+  // Add other commands as needed (e.g., change reporting interval)
+}
+
+void sendTelemetry() {
+  float temp = readTemperature();
+  float hum = readHumidity();
+  int co2 = readCO2();
+  bool occupied = readOccupancy();
+
+  // Create JSON payload
+  StaticJsonDocument<256> doc;
+  doc["deviceId"] = deviceId;
+  doc["temperatureC"] = temp;
+  doc["humidity"] = hum;
+  doc["co2PPM"] = co2;
+  doc["occupied"] = occupied;
+  doc["timestamp"] = millis(); // For simplicity, use millis(). Use NTP for real time in production.
+
+  char jsonBuffer[256];
+  serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
+
+  Serial.printf("Sending telemetry: %s\n", jsonBuffer);
+  client.publish(telemetryTopic, jsonBuffer);
+}
+
+// --- Sensor Reading Placeholders ---
+float readTemperature() {
+  float t = dht.readTemperature();
+  if (isnan(t)) {
+    Serial.println("Failed to read temperature from DHT sensor!");
+    return 0.0;
+  }
+  return t;
+}
+
+float readHumidity() {
+  float h = dht.readHumidity();
+  if (isnan(h)) {
+    Serial.println("Failed to read humidity from DHT sensor!");
+    return 0.0;
+  }
+  return h;
+}
+
+int readCO2() {
+  // Replace with actual CO2 sensor reading logic (e.g., MH-Z19B.getCO2())
+  // For now, simulate
+  static int simulatedCO2 = 400; // Start at normal
+  if (readOccupancy()) {
+    simulatedCO2 += random(5, 20); // Increase if occupied
+    if (simulatedCO2 > 2000) simulatedCO2 = 2000;
+  } else {
+    simulatedCO2 -= random(1, 5); // Decrease if vacant
+    if (simulatedCO2 < 400) simulatedCO2 = 400;
+  }
+  return simulatedCO2;
+}
+
+bool readOccupancy() {
+  // Read state from PIR sensor
+  return digitalRead(OCCUPANCY_PIN) == HIGH;
+}
+
+// --- HVAC Control ---
+void setHVACState(bool fanOn, bool compressorOn, bool heatOn) {
+  // Logic for your HVAC relays
+  digitalWrite(HVAC_FAN_PIN, fanOn ? HIGH : LOW);
+  digitalWrite(HVAC_COMPRESSOR_PIN, compressorOn ? HIGH : LOW);
+  digitalWrite(HVAC_HEAT_PIN, heatOn ? HIGH : LOW);
+}
+2. Azure Function (__init__.py - Python)
+This Azure Function would be triggered by new telemetry messages arriving in Azure IoT Hub (via a routing rule to an Event Hub, which then triggers the Function).
+
+Python
+
+import logging
+import json
+import os
+import azure.functions as func
+from azure.iot.hub import IoTHubRegistryManager
+from azure.iot.hub.protocol.iot_hub_error import IoTHubError
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+
+# --- Azure IoT Hub Registry Manager Configuration (for sending C2D messages) ---
+# Connection string for IoT Hub Registry Manager (NOT device connection string)
+# Found in Azure Portal -> IoT Hub -> Shared access policies -> iothubowner
+IOT_HUB_CONNECTION_STRING = os.environ["IoTHubOwnerConnectionString"]
+registry_manager = IoTHubRegistryManager.from_connection_string(IOT_HUB_CONNECTION_STRING)
+
+
+def main(eventhubMessage: func.EventHubEvent):
+    logging.info('Python EventHub trigger function processed a message: %s',
+                 eventhubMessage.get_body().decode('utf-8'))
+
+    try:
+        # Decode the telemetry message
+        telemetry_data = json.loads(eventhubMessage.get_body().decode('utf-8'))
+        
+        device_id = telemetry_data.get('deviceId')
+        temperature_c = telemetry_data.get('temperatureC')
+        humidity = telemetry_data.get('humidity')
+        co2_ppm = telemetry_data.get('co2PPM')
+        occupied = telemetry_data.get('occupied')
+        timestamp = telemetry_data.get('timestamp')
+
+        logging.info(f"Received telemetry from {device_id}: Temp={temperature_c}C, Hum={humidity}%, CO2={co2_ppm}ppm, Occupied={occupied}")
+
+        # --- Conceptual AI Decision Logic ---
+        # In a real system, you would:
+        # 1. Store telemetry in a database (e.g., Azure Cosmos DB, Azure SQL DB)
+        # 2. Trigger Time-Series Forecasting model (e.g., via Azure Machine Learning endpoint)
+        #    - Input: Historical data, current telemetry, weather forecast (from external API)
+        #    - Output: Predicted future temp/CO2 needs
+        # 3. Trigger Reinforcement Learning model (e.g., via Azure Machine Learning endpoint)
+        #    - Input: Current state (temp, hum, CO2, occupied, time of day), predicted future state,
+        #             user preferences.
+        #    - Output: Optimal HVAC control policy (e.g., desired setpoint, fan state, compressor state)
+
+        # --- SIMPLIFIED AI DECISION FOR DEMO ---
+        # Based on current readings and a simple comfort rule
+        target_temp_c = 24.0 # Default comfort temperature
+        fan_on = False
+        compressor_on = False
+        heat_on = False
+        
+        if occupied:
+            # If occupied, try to maintain comfort
+            if temperature_c > target_temp_c + 1.0: # Too warm
+                compressor_on = True # Turn on AC
+                fan_on = True
+            elif temperature_c < target_temp_c - 1.0: # Too cold
+                heat_on = True # Turn on heater
+                fan_on = True
+            
+            if co2_ppm > 800: # High CO2, need ventilation
+                fan_on = True # Ensure fan is on for air circulation
+                # In a real system, would trigger fresh air intake if available
+        else:
+            # If unoccupied, save energy (turn off or set to energy-saving temps)
+            # This is where RL would learn optimal "unoccupied" strategies.
+            # E.g., let temp drift within a wider band, or turn off completely.
+            logging.info("Space is unoccupied, applying energy-saving logic.")
+            if temperature_c > 28.0 or temperature_c < 18.0: # Only engage if very extreme
+                 fan_on = True # Small fan to circulate if needed
+                 # No compressor or heat to save energy
+
+        # --- Send Command Back to ESP32 ---
+        command_payload = {
+            "command": "setHVAC",
+            "fan": fan_on,
+            "compressor": compressor_on,
+            "heat": heat_on
+        }
+        
+        try:
+            logging.info(f"Sending command to {device_id}: {json.dumps(command_payload)}")
+            registry_manager.send_c2d_message(device_id, json.dumps(command_payload))
+            logging.info("Command sent successfully.")
+        except IoTHubError as ex:
+            logging.error(f"Error sending C2D message: {ex}")
+        except Exception as ex:
+            logging.error(f"Unexpected error: {ex}")
+
+    except json.JSONDecodeError:
+        logging.error("Invalid JSON format in received message.")
+    except Exception as e:
+        logging.error(f"Error processing message: {e}")
