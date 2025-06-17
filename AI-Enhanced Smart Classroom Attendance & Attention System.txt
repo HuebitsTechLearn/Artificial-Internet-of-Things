@@ -1,0 +1,424 @@
+Conceptual Code Snippets for AI-Enhanced Smart Classroom System (Raspberry Pi)
+1. classroom_monitor.py - Main Raspberry Pi Application
+This script will handle camera input, run AI models, and send data to Firebase.
+
+Python
+
+import cv2
+import numpy as np
+import time
+import os
+import firebase_admin
+from firebase_admin import credentials, db
+from collections import deque
+import logging
+
+# --- Configure Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Firebase Configuration ---
+# IMPORTANT: Replace 'path/to/your/serviceAccountKey.json' with your actual path.
+# Get this from Firebase Project Settings -> Service Accounts -> Generate new private key
+try:
+    cred = credentials.Certificate("path/to/your/serviceAccountKey.json")
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': 'https://YOUR-FIREBASE-PROJECT-ID.firebaseio.com' # Replace with your project URL
+    })
+    ref = db.reference('/') # Root reference
+    logging.info("Firebase initialized successfully.")
+except Exception as e:
+    logging.error(f"Error initializing Firebase: {e}")
+    exit()
+
+# --- AI Model Paths (Adjust as per your setup) ---
+# FaceNet model (e.g., pre-trained Keras model or TFLite)
+# You might need to implement face detection (e.g., Haar Cascade, MTCNN) before FaceNet.
+# For simplicity, this example assumes a direct FaceNet inference on detected faces.
+FACENET_MODEL_PATH = "models/facenet_keras.h5" # Or TFLite model
+# Ensure you have the MediaPipe library installed.
+
+# --- Global Variables ---
+STUDENT_DATABASE = {} # Stores {student_id: face_embedding} - Load from Firebase or local storage
+ENROLLMENT_THRESHOLD = 0.8 # Cosine similarity threshold for face recognition
+ATTENTION_THRESHOLD = 0.7 # Placeholder for attention score (0-1, higher is more attentive)
+FRAME_SKIP = 5 # Process every Nth frame to reduce load (e.g., 5 means 1 frame every 5)
+
+# --- Load FaceNet Model (Conceptual) ---
+# This part depends on whether you use Keras/TF or TFLite
+try:
+    # Example for Keras/TensorFlow model
+    # from tensorflow.keras.models import load_model
+    # facenet_model = load_model(FACENET_MODEL_PATH)
+    # logging.info("FaceNet model loaded.")
+
+    # Example placeholder for TFLite (more suitable for RPi)
+    # import tflite_runtime.interpreter as tflite
+    # interpreter = tflite.Interpreter(model_path=FACENET_MODEL_PATH)
+    # interpreter.allocate_tensors()
+    # input_details = interpreter.get_input_details()
+    # output_details = interpreter.get_output_details()
+    logging.info("FaceNet model placeholder loaded (replace with actual model loading).")
+
+except Exception as e:
+    logging.error(f"Error loading FaceNet model: {e}")
+    # exit() # Comment out for conceptual demo without actual model file
+
+# --- MediaPipe Setup ---
+import mediapipe as mp
+mp_face_detection = mp.solutions.face_detection
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
+
+face_detection = mp_face_detection.FaceDetection(min_detection_confidence=0.7)
+pose_detection = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+logging.info("MediaPipe Face Detection and Pose Estimation initialized.")
+
+# --- Helper Functions ---
+
+def get_face_embedding(face_roi):
+    """
+    Conceptual function to get FaceNet embedding from a cropped face ROI.
+    In a real implementation, this would involve:
+    1. Preprocessing face_roi (resize to FaceNet input size, normalize).
+    2. Running FaceNet inference.
+    """
+    # Placeholder: return a random embedding for demonstration
+    return np.random.rand(128).astype(np.float32)
+
+def recognize_face(embedding, student_db):
+    """
+    Compares a new face embedding to known student embeddings.
+    Uses cosine similarity for comparison.
+    """
+    max_similarity = -1
+    recognized_id = "Unknown"
+    
+    if not student_db:
+        return recognized_id, max_similarity
+
+    for student_id, stored_embedding in student_db.items():
+        # Cosine similarity formula: dot(A, B) / (norm(A) * norm(B))
+        similarity = np.dot(embedding, stored_embedding) / (np.linalg.norm(embedding) * np.linalg.norm(stored_embedding))
+        if similarity > max_similarity:
+            max_similarity = similarity
+            recognized_id = student_id
+    
+    if max_similarity < ENROLLMENT_THRESHOLD:
+        return "Unknown", max_similarity
+    
+    return recognized_id, max_similarity
+
+def calculate_attention_score(landmarks):
+    """
+    Conceptual function to calculate attention score based on pose landmarks.
+    This is a simplification; a real model would be more complex.
+    Factors could include:
+    - Head pose (pitch, yaw)
+    - Shoulder alignment
+    - Eye gaze (requires separate eye tracking)
+    - Slouching detection (e.g., distance between nose and hip landmarks)
+    """
+    if not landmarks:
+        return 0.0 # No pose detected
+
+    nose_x = landmarks.landmark[mp_pose.PoseLandmark.NOSE].x
+    nose_y = landmarks.landmark[mp_pose.PoseLandmark.NOSE].y
+    
+    # Example: Check if head is relatively upright and centered
+    # This is a very basic heuristic.
+    left_shoulder_y = landmarks.landmark[mp_pose.PoseLandmark.LEFT_SHOULDER].y
+    right_shoulder_y = landmarks.landmark[mp_pose.PoseLandmark.RIGHT_SHOULDER].y
+    
+    # If shoulders are significantly uneven or nose is very low (slouching)
+    if abs(left_shoulder_y - right_shoulder_y) > 0.05 or nose_y > 0.6: # Y-coords are normalized 0-1
+        return 0.2 # Low attention
+    
+    # If nose is roughly in the upper half of the frame (facing forward)
+    if nose_y < 0.5:
+        return 0.9 # High attention
+        
+    return 0.5 # Moderate attention
+
+
+def load_student_database_from_firebase():
+    """Loads student embeddings from Firebase."""
+    try:
+        students_data = ref.child('students').get()
+        if students_data:
+            for student_id, data in students_data.items():
+                if 'embedding' in data:
+                    # Convert list from Firebase back to numpy array
+                    STUDENT_DATABASE[student_id] = np.array(data['embedding'], dtype=np.float32)
+            logging.info(f"Loaded {len(STUDENT_DATABASE)} students from Firebase.")
+        else:
+            logging.info("No students found in Firebase database.")
+    except Exception as e:
+        logging.error(f"Error loading student database from Firebase: {e}")
+
+def update_attendance_to_firebase(student_id, timestamp, status="present"):
+    """Updates attendance status in Firebase."""
+    try:
+        attendance_path = f'attendance/{timestamp.strftime("%Y-%m-%d")}/{student_id}'
+        ref.child(attendance_path).set({
+            'status': status,
+            'check_in_time': timestamp.strftime("%H:%M:%S"),
+            'last_seen': timestamp.timestamp() # Unix timestamp for easier sorting/filtering
+        })
+        logging.info(f"Attendance updated for {student_id} at {timestamp}.")
+    except Exception as e:
+        logging.error(f"Error updating attendance for {student_id}: {e}")
+
+def update_attention_to_firebase(student_id, timestamp, attention_score):
+    """Updates attention score for a student in Firebase."""
+    try:
+        attention_path = f'attention/{timestamp.strftime("%Y-%m-%d")}/{student_id}'
+        # Use push() for new child entries to keep a history of scores, or set() to update latest
+        ref.child(attention_path).child(str(int(timestamp.timestamp()))).set({
+            'score': round(attention_score, 2)
+        })
+        logging.debug(f"Attention score for {student_id} updated: {attention_score}.")
+    except Exception as e:
+        logging.error(f"Error updating attention for {student_id}: {e}")
+
+
+# --- Main Loop ---
+def run_classroom_monitor():
+    # Load initial student database
+    load_student_database_from_firebase()
+
+    # Initialize camera(s)
+    # For Raspberry Pi Camera (CSI), use picamera or GStreamer with OpenCV
+    # cap_face = cv2.VideoCapture(0) # Assuming first camera for faces
+    # cap_pose = cv2.VideoCapture(1) # Assuming second camera for poses
+    
+    # For simplicity, using one camera for both in this example
+    cap = cv2.VideoCapture(0) 
+
+    if not cap.isOpened():
+        logging.error("Failed to open camera(s). Exiting.")
+        return
+
+    logging.info("Starting classroom monitoring...")
+    frame_count = 0
+    
+    # Track student attendance for a session
+    session_attendance = {} # {student_id: True/False}
+    
+    # Track recent attention scores for a student to smooth out
+    student_attention_scores = {} # {student_id: deque of recent scores}
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                logging.warning("Failed to grab frame. Exiting.")
+                break
+
+            frame_count += 1
+            if frame_count % FRAME_SKIP != 0:
+                continue # Skip frames to reduce processing load
+
+            timestamp = datetime.datetime.now() # Use current time
+
+            # Convert to RGB for MediaPipe (OpenCV reads BGR)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # --- 1. Face Detection and Recognition for Attendance ---
+            face_results = face_detection.process(frame_rgb)
+            
+            if face_results.detections:
+                for detection in face_results.detections:
+                    bboxC = detection.location_data.relative_bounding_box
+                    ih, iw, _ = frame.shape
+                    x, y, w, h = int(bboxC.xmin * iw), int(bboxC.ymin * ih), \
+                                 int(bboxC.width * iw), int(bboxC.height * ih)
+                    
+                    # Ensure bounding box is within frame boundaries
+                    x, y, w, h = max(0, x), max(0, y), min(iw - x, w), min(ih - y, h)
+                    
+                    if w > 0 and h > 0:
+                        face_roi = frame[y:y+h, x:x+w]
+                        if face_roi.size > 0: # Ensure ROI is not empty
+                            embedding = get_face_embedding(face_roi)
+                            student_id, similarity = recognize_face(embedding, STUDENT_DATABASE)
+
+                            if student_id != "Unknown" and student_id not in session_attendance:
+                                session_attendance[student_id] = True
+                                update_attendance_to_firebase(student_id, timestamp)
+                                logging.info(f"Recognized and marked present: {student_id}")
+
+                            # Draw bounding box and label (for debugging/display)
+                            color = (0, 255, 0) if student_id != "Unknown" else (0, 0, 255)
+                            label_text = f"{student_id} ({similarity:.2f})" if student_id != "Unknown" else "Unknown"
+                            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                            cv2.putText(frame, label_text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            # --- 2. Pose Estimation for Attention Monitoring ---
+            pose_results = pose_detection.process(frame_rgb)
+
+            if pose_results.pose_landmarks:
+                # Assuming one main person or focusing on the recognized student
+                # For a multi-person scenario, you'd need to associate poses with faces
+                # For simplicity, let's just use the first detected pose
+                
+                # Draw pose landmarks (for debugging/display)
+                mp_drawing.draw_landmarks(frame, pose_results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                                          mp_drawing.DrawingSpec(color=(245,117,66), thickness=2, circle_radius=2),
+                                          mp_drawing.DrawingSpec(color=(245,66,230), thickness=2, circle_radius=2))
+                
+                attention_score = calculate_attention_score(pose_results.pose_landmarks)
+                
+                # For simplicity, assign attention to a recognized student if one is found
+                # In a real system, you'd track attention per student based on their pose.
+                if session_attendance: # If any student is marked present
+                    first_recognized_student = next(iter(session_attendance)) # Just picking one
+                    
+                    if first_recognized_student not in student_attention_scores:
+                        student_attention_scores[first_recognized_student] = deque(maxlen=10) # Keep last 10 scores
+                    student_attention_scores[first_recognized_student].append(attention_score)
+                    
+                    # Calculate average attention over recent frames
+                    avg_attention = np.mean(student_attention_scores[first_recognized_student])
+                    
+                    update_attention_to_firebase(first_recognized_student, timestamp, avg_attention)
+                    if avg_attention < ATTENTION_THRESHOLD:
+                        logging.warning(f"Low attention detected for {first_recognized_student}: {avg_attention:.2f}")
+
+
+            # Optional: Display frame (can be disabled for headless deployment)
+            cv2.imshow('Classroom Monitor', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+            time.sleep(0.1) # Small delay to manage CPU usage
+
+    except KeyboardInterrupt:
+        logging.info("Stopping classroom monitor.")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        face_detection.close()
+        pose_detection.close()
+        logging.info("Resources released.")
+
+if __name__ == "__main__":
+    import datetime # Import inside for consistency with loop
+    
+    # --- Example Enrollment (Run this once per student for initial setup) ---
+    # This would typically be a separate script or a dedicated enrollment mode
+    def enroll_student(student_id, image_path):
+        enroll_img = cv2.imread(image_path)
+        if enroll_img is None:
+            logging.error(f"Could not load enrollment image: {image_path}")
+            return
+
+        enroll_img_rgb = cv2.cvtColor(enroll_img, cv2.COLOR_BGR2RGB)
+        face_results = face_detection.process(enroll_img_rgb)
+        
+        if face_results.detections:
+            for detection in face_results.detections:
+                bboxC = detection.location_data.relative_bounding_box
+                ih, iw, _ = enroll_img.shape
+                x, y, w, h = int(bboxC.xmin * iw), int(bboxC.ymin * ih), \
+                             int(bboxC.width * iw), int(bboxC.height * ih)
+                
+                face_roi = enroll_img[y:y+h, x:x+w]
+                if face_roi.size > 0:
+                    embedding = get_face_embedding(face_roi) # Get embedding for the enrolled student
+                    
+                    # Store in Firebase
+                    try:
+                        ref.child('students').child(student_id).set({
+                            'name': student_id, # Or full name
+                            'embedding': embedding.tolist() # Convert numpy array to list for JSON
+                        })
+                        STUDENT_DATABASE[student_id] = embedding # Update local cache
+                        logging.info(f"Student {student_id} enrolled with embedding.")
+                        return
+                    except Exception as e:
+                        logging.error(f"Error enrolling student {student_id} to Firebase: {e}")
+        logging.warning(f"No face detected in enrollment image for {student_id}.")
+
+    # Uncomment and run this part to enroll a student (e.g., student1.jpg should contain student's face)
+    # enroll_student("JohnDoe", "path/to/student_images/john_doe.jpg")
+    # enroll_student("JaneSmith", "path/to/student_images/jane_smith.jpg")
+    
+    run_classroom_monitor()
+
+2. Firebase Realtime Database Structure (Conceptual JSON)
+This is how your data might be structured in Firebase.
+
+JSON
+
+{
+  "students": {
+    "JohnDoe": {
+      "name": "John Doe",
+      "embedding": [0.123, -0.456, ..., 0.789] // FaceNet embedding as a list
+    },
+    "JaneSmith": {
+      "name": "Jane Smith",
+      "embedding": [0.987, -0.654, ..., 0.321]
+    }
+  },
+  "attendance": {
+    "2025-06-17": { // Date
+      "JohnDoe": {
+        "status": "present",
+        "check_in_time": "10:05:30",
+        "last_seen": 1718625930.0 // Unix timestamp
+      },
+      "JaneSmith": {
+        "status": "present",
+        "check_in_time": "10:06:15",
+        "last_seen": 1718625975.0
+      },
+      "Unknown_1": { // For unrecognised faces
+        "status": "unrecognized",
+        "check_in_time": "10:07:00",
+        "last_seen": 1718626020.0
+      }
+    }
+  },
+  "attention": {
+    "2025-06-17": { // Date
+      "JohnDoe": {
+        "1718625935": { "score": 0.85 }, // Unix timestamp as key for historical scores
+        "1718625940": { "score": 0.88 },
+        "1718626000": { "score": 0.40 } // Example of low attention
+      },
+      "JaneSmith": {
+        "1718625970": { "score": 0.92 },
+        "1718626010": { "score": 0.90 }
+      }
+    }
+  }
+}
+3. Firebase Realtime Database Rules (Conceptual database.rules.json)
+These rules control read/write access to your data. For a production system, these rules need to be much more granular and secure.
+
+JSON
+
+{
+  "rules": {
+    // Public read for everyone, private write for admin (or trusted server/device)
+    // This is a very permissive setup for testing. Adjust for security.
+    ".read": "true",
+    ".write": "true",
+
+    // More secure example:
+    "students": {
+      ".read": "auth != null", // Only authenticated users can read
+      ".write": "auth != null && root.child('admins').hasChild(auth.uid)" // Only admins can write
+    },
+    "attendance": {
+      ".read": "auth != null",
+      ".write": "auth != null && root.child('classroomDevices').hasChild(auth.uid)" // Devices write, admins read/write
+    },
+    "attention": {
+      ".read": "auth != null",
+      ".write": "auth != null && root.child('classroomDevices').hasChild(auth.uid)"
+    }
+    // You would define 'admins' and 'classroomDevices' nodes and populate them with UIDs
+  }
+}
