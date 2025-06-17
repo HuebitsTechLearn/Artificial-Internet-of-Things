@@ -1,0 +1,294 @@
+1. ESP32 Firmware (main.ino - Arduino C++)
+This sketch focuses on MPU6050, Pulse Sensor, a conceptual fatigue level, and MQTT communication. The Decision Tree logic for motion is implemented as a set of if/else rules for simplicity.
+
+C++
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <Adafruit_MPU6050.h> // For MPU6050 sensor
+#include <Adafruit_Sensor.h>
+#include <Wire.h> // For I2C communication with MPU6050
+
+// --- WiFi Configuration ---
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// --- MQTT Broker Configuration ---
+const char* mqtt_server = "YOUR_MQTT_BROKER_IP_OR_HOSTNAME"; // e.g., "broker.hivemq.com"
+const int mqtt_port = 1883; // Or 8883 for MQTTS
+const char* mqtt_client_id = "SmartHelmet001";
+const char* telemetry_topic = "helmet/telemetry";
+const char* alerts_topic = "helmet/alerts";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// --- Sensor Pin Definitions ---
+#define PULSE_SENSOR_PIN 34 // Analog pin for Pulse Sensor (ESP32 ADC1_CH6)
+#define BUZZER_PIN 2        // GPIO pin for buzzer
+#define LED_RED_PIN 15      // GPIO pin for Red LED (Alert)
+#define LED_GREEN_PIN 14    // GPIO pin for Green LED (Safe)
+
+// --- MPU6050 Setup ---
+Adafruit_MPU6050 mpu;
+
+// --- Global Variables for State & Timers ---
+long lastMsg = 0;
+const int PUBLISH_INTERVAL_MS = 1000; // Publish every 1 second
+
+// Fatigue & Motion Detection Parameters
+const int FATIGUE_THRESHOLD = 70; // Simulated fatigue level (0-100)
+const float FALL_ACCEL_THRESHOLD = 2.5; // G-forces for fall detection
+const int NO_MOVEMENT_DURATION_SEC = 30; // Seconds of no movement to trigger alert
+
+unsigned long lastMovementTime = 0; // Timestamp of last significant movement
+bool isHelmetSafe = true; // Overall safety status
+
+// --- Function Prototypes ---
+void connectWifi();
+void connectMqtt();
+void publishTelemetry(float temp, float hum, float accelX, float accelY, float accelZ, int heartRate, int fatigueLevel, String motionState, bool isSafe);
+void publishAlert(String alertType, String message);
+void triggerLocalAlert(bool on);
+int readPulseSensor();
+int simulateFatigueLevel();
+String analyzeMotionBehavior(float ax, float ay, float az, float gx, float gy, float gz);
+
+// --- Setup ---
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize MPU6050
+  Wire.begin();
+  if (!mpu.begin()) {
+    Serial.println("Failed to find MPU6050 chip");
+    while (1) delay(10); // Halt if MPU not found
+  }
+  Serial.println("MPU6050 found!");
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
+
+  // Pin modes for alerts
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_GREEN_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_RED_PIN, LOW);
+  digitalWrite(LED_GREEN_PIN, HIGH); // Green LED on initially
+
+  connectWifi();
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(nullptr); // No incoming commands in this simple setup
+
+  Serial.println("Setup Complete.");
+}
+
+// --- Loop ---
+void loop() {
+  if (!client.connected()) {
+    connectMqtt();
+  }
+  client.loop(); // Keep MQTT connection alive
+
+  long now = millis();
+  if (now - lastMsg > PUBLISH_INTERVAL_MS) {
+    lastMsg = now;
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    float accelX = a.acceleration.x;
+    float accelY = a.acceleration.y;
+    float accelZ = a.acceleration.z;
+    float gyroX = g.gyro.x;
+    float gyroY = g.gyro.y;
+    float gyroZ = g.gyro.z;
+    float mpuTemp = temp.temperature;
+
+    int heartRate = readPulseSensor(); // Simulated or actual
+    int fatigueLevel = simulateFatigueLevel(); // Simulated or based on eye state
+    String motionState = analyzeMotionBehavior(accelX, accelY, accelZ, gyroX, gyroY, gyroZ);
+
+    isHelmetSafe = true; // Assume safe until a condition is met
+    String alertMessage = "";
+
+    // --- Safety Checks & Local Alerts (Decision Tree Logic) ---
+
+    // 1. Fall Detection
+    float total_acceleration = sqrt(accelX*accelX + accelY*accelY + accelZ*accelZ);
+    if (total_acceleration > FALL_ACCEL_THRESHOLD * 9.81) { // Convert G to m/s^2 if needed
+      alertMessage = "FALL DETECTED!";
+      isHelmetSafe = false;
+    }
+
+    // 2. Fatigue Detection (from simulated/real eye state)
+    if (fatigueLevel > FATIGUE_THRESHOLD) {
+      if (alertMessage == "") alertMessage = "HIGH FATIGUE!";
+      else alertMessage += ", HIGH FATIGUE!";
+      isHelmetSafe = false;
+    }
+
+    // 3. No Movement / Inactivity Detection
+    if (motionState == "No Movement") {
+        unsigned long currentMillis = millis();
+        if (lastMovementTime == 0) { // First time detecting no movement
+            lastMovementTime = currentMillis;
+        } else if ((currentMillis - lastMovementTime) / 1000 >= NO_MOVEMENT_DURATION_SEC) {
+            if (alertMessage == "") alertMessage = "PROLONGED INACTIVITY!";
+            else alertMessage += ", PROLONGED INACTIVITY!";
+            isHelmetSafe = false;
+        }
+    } else {
+        lastMovementTime = millis(); // Reset timer if movement detected
+    }
+
+    // 4. Hazardous Environment (Conceptual, if gas sensors were added)
+    // float gas_level = readGasSensor();
+    // if (gas_level > GAS_THRESHOLD) {
+    //   if (alertMessage == "") alertMessage = "HAZARDOUS GAS DETECTED!";
+    //   else alertMessage += ", HAZARDOUS GAS DETECTED!";
+    //   isHelmetSafe = false;
+    // }
+
+    // --- Apply Local Alerts ---
+    triggerLocalAlert(!isHelmetSafe); // Buzzer/Red LED if not safe
+
+    // --- Publish Telemetry & Alerts to MQTT ---
+    publishTelemetry(mpuTemp, 0.0, accelX, accelY, accelZ, heartRate, fatigueLevel, motionState, isHelmetSafe);
+    if (!isHelmetSafe) {
+      publishAlert("CRITICAL", alertMessage);
+    }
+  }
+}
+
+// --- Function Definitions ---
+void connectWifi() {
+  Serial.printf("Connecting to WiFi %s ", ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" CONNECTED");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void connectMqtt() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect(mqtt_client_id)) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" trying again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+void publishTelemetry(float temp, float hum, float accelX, float accelY, float accelZ, int heartRate, int fatigueLevel, String motionState, bool isSafe) {
+  StaticJsonDocument<500> doc;
+  doc["deviceId"] = mqtt_client_id;
+  doc["timestamp"] = millis(); // Use millis() or NTP for proper timestamps
+  doc["temperatureC"] = temp;
+  doc["humidity"] = hum; // Placeholder if not using specific sensor
+  doc["accelX"] = accelX;
+  doc["accelY"] = accelY;
+  doc["accelZ"] = accelZ;
+  doc["heartRate"] = heartRate;
+  doc["fatigueLevel"] = fatigueLevel;
+  doc["motionState"] = motionState;
+  doc["isSafe"] = isSafe;
+
+  char jsonBuffer[512];
+  serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
+
+  Serial.printf("Publishing telemetry: %s\n", jsonBuffer);
+  client.publish(telemetry_topic, jsonBuffer);
+}
+
+void publishAlert(String alertType, String message) {
+  StaticJsonDocument<200> doc;
+  doc["deviceId"] = mqtt_client_id;
+  doc["timestamp"] = millis();
+  doc["alertType"] = alertType;
+  doc["message"] = message;
+
+  char jsonBuffer[256];
+  serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
+
+  Serial.printf("Publishing alert: %s\n", jsonBuffer);
+  client.publish(alerts_topic, jsonBuffer);
+}
+
+void triggerLocalAlert(bool on) {
+  if (on) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    digitalWrite(LED_RED_PIN, HIGH);
+    digitalWrite(LED_GREEN_PIN, LOW);
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(LED_RED_PIN, LOW);
+    digitalWrite(LED_GREEN_PIN, HIGH);
+  }
+}
+
+int readPulseSensor() {
+  // Analog read from pulse sensor
+  int pulseRaw = analogRead(PULSE_SENSOR_PIN);
+  // This needs much more sophisticated signal processing for real heart rate.
+  // For demo, just simulate based on raw reading.
+  return map(pulseRaw, 0, 4095, 60, 120); // Map raw ADC value to 60-120 BPM
+}
+
+int simulateFatigueLevel() {
+  // This is highly simplified. A real system would use a CNN on eye state.
+  // For demo, let's simulate a fatigue level that slowly increases.
+  static unsigned long lastFatigueIncrease = 0;
+  static int currentFatigue = 10; // Start with low fatigue
+
+  if (millis() - lastFatigueIncrease > 60000) { // Increase fatigue every minute
+    currentFatigue += random(1, 5);
+    if (currentFatigue > 100) currentFatigue = 100;
+    lastFatigueIncrease = millis();
+  }
+
+  // Add random spikes or drops
+  if (random(100) < 5) { // 5% chance of a fatigue spike
+    currentFatigue += random(10, 20);
+    if (currentFatigue > 100) currentFatigue = 100;
+  }
+  if (random(100) < 2) { // 2% chance of a fatigue drop
+    currentFatigue -= random(5, 10);
+    if (currentFatigue < 0) currentFatigue = 0;
+  }
+  return currentFatigue;
+}
+
+
+String analyzeMotionBehavior(float ax, float ay, float az, float gx, float gy, float gz) {
+    // This is a simplified Decision Tree/rule-based logic for motion analysis
+    float total_accel_magnitude = sqrt(ax*ax + ay*ay + az*az);
+    float total_gyro_magnitude = sqrt(gx*gx + gy*gy + gz*gz);
+
+    // Thresholds (tune these based on real-world data)
+    const float STATIC_ACCEL_THRESHOLD = 0.2; // m/s^2 or G's
+    const float STATIC_GYRO_THRESHOLD = 0.5;  // deg/s
+    const float HIGH_ACCEL_THRESHOLD = 5.0; // G's for impact
+    const float HIGH_GYRO_THRESHOLD = 200.0; // deg/s for erratic movement
+
+    if (total_accel_magnitude < STATIC_ACCEL_THRESHOLD && total_gyro_magnitude < STATIC_GYRO_THRESHOLD) {
+        return "No Movement";
+    } else if (total_accel_magnitude > HIGH_ACCEL_THRESHOLD || total_gyro_magnitude > HIGH_GYRO_THRESHOLD) {
+        // Distinguish between fall and high impact based on specific patterns (more complex)
+        // For simplicity, let's just say "Erratic/Impact"
+        return "Erratic/Impact";
+    } else if (total_accel_magnitude > STATIC_ACCEL_THRESHOLD && total_gyro_magnitude > STATIC_GYRO_THRESHOLD) {
+        return "Normal Movement";
+    }
+    return "Undetermined";
+}
