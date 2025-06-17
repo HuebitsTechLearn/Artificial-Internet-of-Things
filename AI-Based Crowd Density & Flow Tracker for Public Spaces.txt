@@ -1,0 +1,363 @@
+Conceptual Code Snippets for AI-Based Crowd Density & Flow Tracker
+1. ESP32-CAM Firmware (main.ino - Arduino C++)
+This Arduino sketch shows how you'd set up the ESP32-CAM, capture frames, conceptually interact with an Edge TPU, and send data to Google Cloud IoT Core via MQTT.
+
+Note: Integrating an actual Edge TPU (like Google Coral) with an ESP32-CAM is highly complex. The Coral USB Accelerator typically requires a Linux host (like a Raspberry Pi) and is not directly plug-and-play with an ESP32. If using an integrated Coral module, it would involve specific SDKs. For this conceptual code, the Edge TPU inference is represented as a placeholder.
+
+C++
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h> // For MQTT
+#include <ArduinoJson.h>    // For creating JSON payloads
+#include "esp_camera.h"     // For ESP32-CAM
+#include "soc/soc.h"        // Disable brownout detector
+#include "soc/rtc_cntl_reg.h" // Disable brownout detector
+
+// --- WiFi Configuration ---
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// --- Google Cloud IoT Core MQTT Configuration ---
+// These are placeholders. You'd generate these credentials securely.
+// For production, you'd use JWTs for authentication.
+// See: https://cloud.google.com/iot/docs/how-tos/authenticate-devices
+const char* mqtt_broker = "mqtt.googleapis.com";
+const int mqtt_port = 8883;
+const char* project_id = "your-gcp-project-id";
+const char* region = "us-central1";
+const char* registry_id = "your-iot-registry-id";
+const char* device_id = "esp32cam-crowd-tracker-001"; // Unique device ID
+
+// This is the MQTT client ID format for Google Cloud IoT Core
+const char* mqtt_client_id = "projects/your-gcp-project-id/locations/us-central1/registries/your-iot-registry-id/devices/esp32cam-crowd-tracker-001";
+
+// MQTT Publish topic for telemetry
+const char* mqtt_publish_topic = "/devices/" DEVICE_ID "/events";
+
+// Device certificate and private key (generated during device registration in Google Cloud IoT Core)
+// IMPORTANT: In production, store these securely on Flash or external secure element.
+// For demonstration, hardcoding here (NOT recommended for production).
+const char* device_cert = R"EOF(
+-----BEGIN CERTIFICATE-----
+YOUR_DEVICE_CERTIFICATE_CONTENT_HERE
+-----END CERTIFICATE-----
+)EOF";
+
+const char* private_key = R"EOF(
+-----BEGIN RSA PRIVATE KEY-----
+YOUR_DEVICE_PRIVATE_KEY_CONTENT_HERE
+-----END RSA PRIVATE KEY-----
+)EOF";
+
+// Google's Root CA Certificate (to verify broker)
+const char* google_root_ca = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDnoCCAoWgAwIBAgIQCaVT...
+... (full certificate content from Google IoT Core documentation) ...
+-----END CERTIFICATE-----
+)EOF";
+
+
+WiFiClientSecure net;
+PubSubClient client(net);
+
+// --- ESP32-CAM Camera Configuration ---
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+#define BPC_GPIO_NUM      14
+#define WLED_GPIO_NUM      4 // Flash LED
+
+camera_config_t config;
+
+// --- Timers for publishing ---
+long lastMsg = 0;
+const int PUBLISH_INTERVAL_MS = 5000; // Publish every 5 seconds
+
+// --- Function Prototypes ---
+void initCamera();
+void connectWifi();
+void connectMqtt();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void publishCrowdData(int peopleCount, float densityScore);
+
+// --- Setup ---
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector
+  Serial.begin(115200);
+  Serial.setDebugOutput(false); // Disable detailed debug output from ESP-IDF
+
+  pinMode(WLED_GPIO_NUM, OUTPUT);
+  digitalWrite(WLED_GPIO_NUM, LOW); // Turn off flash LED initially
+
+  initCamera();
+  connectWifi();
+
+  // Set MQTT client certificates and server
+  net.setCACert(google_root_ca);
+  net.setCertificate(device_cert);
+  net.setPrivateKey(private_key);
+  client.setServer(mqtt_broker, mqtt_port);
+  client.setCallback(mqttCallback);
+
+  Serial.println("Setup Complete.");
+}
+
+// --- Loop ---
+void loop() {
+  if (!client.connected()) {
+    connectMqtt();
+  }
+  client.loop(); // Keep MQTT connection alive
+
+  long now = millis();
+  if (now - lastMsg > PUBLISH_INTERVAL_MS) {
+    lastMsg = now;
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed!");
+      return;
+    }
+
+    // --- Conceptual: Process Frame with Edge TPU (YOLOv8) ---
+    // In a real scenario, you'd send fb->buf (image bytes) to the Edge TPU
+    // via a library call. The Edge TPU would run YOLOv8 TFLite model.
+    // It would return detected bounding boxes (x, y, w, h, class_id, confidence)
+    
+    // Placeholder results for demonstration:
+    int peopleCount = 0;
+    float densityScore = 0.0;
+    
+    // Simulate detection based on frame content or just dummy data
+    if (fb->len > 10000) { // If image is large enough, simulate more people
+        peopleCount = random(5, 20); // Simulate 5-20 people
+        densityScore = (float)peopleCount / 100.0; // Simulate density
+    } else {
+        peopleCount = random(0, 5); // Simulate 0-5 people
+        densityScore = (float)peopleCount / 50.0;
+    }
+    
+    // --- Conceptual: Clustering for Flow/Density ---
+    // Here, you'd apply clustering algorithms (e.g., K-means on bounding box centroids)
+    // to determine crowd density or track flow. This would be a more complex ML step
+    // that might run on the Edge TPU or on the main ESP32 if light enough.
+    // For now, we use a simple peopleCount and densityScore.
+
+    // Publish processed data
+    publishCrowdData(peopleCount, densityScore);
+
+    esp_camera_fb_return(fb); // Return the frame buffer to the camera
+  }
+}
+
+// --- Function Definitions ---
+void initCamera() {
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000; // 20MHz
+  config.pixel_format = PIXFORMAT_JPEG; // JPEG for efficiency
+
+  // Camera settings (adjust for your needs)
+  config.frame_size = FRAMESIZE_QVGA; // 320x240 for faster processing
+  config.jpeg_quality = 10;           // 0-63, lower means higher quality
+  config.fb_count = 1;                // One frame buffer
+
+  // Init camera
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    ESP.restart();
+  }
+  Serial.println("Camera Initialized.");
+}
+
+void connectWifi() {
+  Serial.printf("Connecting to WiFi %s ", ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" CONNECTED");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void connectMqtt() {
+  Serial.print("Attempting MQTT connection...");
+  // Google IoT Core MQTT uses JWT for authentication, not simple username/password.
+  // This is a simplified connect for conceptual code.
+  // In a real setup, generate a JWT and pass it as password.
+  if (client.connect(mqtt_client_id, "unused", SAS_TOKEN)) { // "unused" for username, JWT as password
+    Serial.println("connected to MQTT broker.");
+    // Subscribe to device commands topic if needed
+    // client.subscribe("/devices/" DEVICE_ID "/commands/#");
+  } else {
+    Serial.print("failed, rc=");
+    Serial.print(client.state());
+    Serial.println(" try again in 5 seconds");
+    delay(5000);
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+  // Handle incoming commands from Google Cloud IoT Core
+  // e.g., change publish interval, change camera settings
+}
+
+void publishCrowdData(int peopleCount, float densityScore) {
+  StaticJsonDocument<200> doc;
+  doc["deviceId"] = DEVICE_ID;
+  doc["timestamp"] = millis(); // Use a proper RTC or NTP for real time in production
+  doc["peopleCount"] = peopleCount;
+  doc["densityScore"] = densityScore;
+
+  char jsonBuffer[256];
+  serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
+
+  Serial.printf("Publishing: %s\n", jsonBuffer);
+  client.publish(mqtt_publish_topic, jsonBuffer);
+}
+2. Google Cloud Function (main.py - Python)
+This Python Cloud Function is triggered by new messages arriving in a Pub/Sub topic (which would be configured to receive data from Google Cloud IoT Core).
+
+Python
+
+import base64
+import json
+import os
+import logging
+from google.cloud import bigquery
+from google.cloud import pubsub_v1
+import datetime
+
+# Configure logging
+logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'INFO'),
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Environment variables (set in Cloud Function configuration)
+BIGQUERY_DATASET_ID = os.environ.get('BIGQUERY_DATASET_ID', 'your_bigquery_dataset')
+BIGQUERY_TABLE_ID = os.environ.get('BIGQUERY_TABLE_ID', 'crowd_data')
+ALERT_PUB_SUB_TOPIC = os.environ.get('ALERT_PUB_SUB_TOPIC', 'your-alert-topic') # Another Pub/Sub topic for alerts
+
+# Threshold for triggering an alert (e.g., if density score exceeds this)
+DENSITY_ALERT_THRESHOLD = float(os.environ.get('DENSITY_ALERT_THRESHOLD', '0.7'))
+PEOPLE_COUNT_ALERT_THRESHOLD = int(os.environ.get('PEOPLE_COUNT_ALERT_THRESHOLD', '15'))
+
+# Initialize Google Cloud clients
+bigquery_client = bigquery.Client()
+publisher = pubsub_v1.PublisherClient()
+alert_topic_path = publisher.topic_path(os.environ.get('GCP_PROJECT'), ALERT_PUB_SUB_TOPIC)
+
+def process_crowd_data(event, context):
+    """
+    Cloud Function to process crowd data from Pub/Sub.
+    Triggered by a Pub/Sub message.
+    """
+    logging.info(f"Received Pub/Sub message: {event}")
+
+    if 'data' not in event:
+        logging.warning("No data in Pub/Sub message payload.")
+        return
+
+    try:
+        # Decode base64 Pub/Sub message data
+        message_data = base64.b64decode(event['data']).decode('utf-8')
+        data = json.loads(message_data)
+        logging.info(f"Decoded data: {data}")
+
+        device_id = data.get('deviceId')
+        timestamp_millis = data.get('timestamp') # Timestamp from ESP32 (millis from boot)
+        people_count = data.get('peopleCount')
+        density_score = data.get('densityScore')
+
+        if not all([device_id, timestamp_millis is not None, people_count is not None, density_score is not None]):
+            logging.warning(f"Incomplete data from device {device_id}. Skipping.")
+            return
+
+        # Use Cloud Function's invocation time as a more reliable timestamp
+        # In a production system, ESP32 should use NTP for accurate timestamps.
+        processed_timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        # 1. Store data in BigQuery
+        table_ref = bigquery_client.dataset(BIGQUERY_DATASET_ID).table(BIGQUERY_TABLE_ID)
+        rows_to_insert = [{
+            "device_id": device_id,
+            "timestamp": processed_timestamp,
+            "people_count": people_count,
+            "density_score": density_score,
+            "raw_payload": json.dumps(data)
+        }]
+
+        errors = bigquery_client.insert_rows_json(table_ref, rows_to_insert)
+        if errors:
+            logging.error(f"Errors inserting rows into BigQuery: {errors}")
+        else:
+            logging.info(f"Data for device {device_id} inserted into BigQuery.")
+
+        # 2. Crowd Density / Flow Analysis & Alerting
+        # Conceptual advanced logic:
+        # If you were sending individual bounding boxes, here you'd:
+        # - Apply DBSCAN/K-means to group nearby people into clusters.
+        # - Calculate average density for areas.
+        # - Track cluster movement over time for flow analysis (requires state or sequence of messages).
+
+        # Simple threshold-based alerting
+        if density_score > DENSITY_ALERT_THRESHOLD or people_count > PEOPLE_COUNT_ALERT_THRESHOLD:
+            alert_message = {
+                "alertType": "CrowdDensityExceeded",
+                "deviceId": device_id,
+                "timestamp": processed_timestamp,
+                "peopleCount": people_count,
+                "densityScore": density_score,
+                "message": f"High crowd density detected at {device_id}!"
+            }
+            # Publish alert to a dedicated Pub/Sub topic
+            future = publisher.publish(alert_topic_path, json.dumps(alert_message).encode('utf-8'))
+            future.result() # Wait for the publish call to complete
+            logging.warning(f"Crowd density alert sent for device {device_id}: {alert_message}")
+
+    except json.JSONDecodeError:
+        logging.error(f"Invalid JSON in message: {message_data}")
+    except Exception as e:
+        logging.error(f"Error processing message: {e}", exc_info=True)
