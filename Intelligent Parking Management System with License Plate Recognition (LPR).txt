@@ -1,0 +1,335 @@
+Conceptual Code Snippets for Intelligent Parking Management System (Raspberry Pi)
+1. parking_node_main.py - Main Raspberry Pi Application
+This script runs on the Raspberry Pi. One instance might be at the entry/exit, and smaller instances could be per-spot.
+
+Python
+
+import cv2
+import numpy as np
+import tensorflow as tf
+import time
+import json
+import logging
+import RPi.GPIO as GPIO # For IR sensors and potentially barrier control
+import firebase_admin
+from firebase_admin import credentials, db
+from datetime import datetime
+
+# --- Configure Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Firebase Configuration ---
+# IMPORTANT: Replace 'path/to/your/serviceAccountKey.json' with your actual path.
+# Get this from Firebase Project Settings -> Service Accounts -> Generate new private key
+try:
+    cred = credentials.Certificate("path/to/your/serviceAccountKey.json")
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': 'https://YOUR-FIREBASE-PROJECT-ID.firebaseio.com/' # Replace with your project URL
+    })
+    cloud_db_ref = db.reference('/') # Root reference for Firebase
+    logging.info("Firebase initialized successfully.")
+except Exception as e:
+    logging.error(f"Error initializing Firebase: {e}")
+    cloud_db_ref = None # Set to None if initialization fails
+
+# --- Device & Parking Lot Configuration ---
+NODE_ID = "entry_exit_node_001" # Unique ID for this Raspberry Pi node
+PARKING_LOT_ID = "lot_A"
+
+# --- AI Model Paths (TensorFlow Lite) ---
+LPR_DETECTION_MODEL_PATH = "models/yolov8_lpr_detection.tflite"
+OCR_MODEL_PATH = "models/lpr_ocr.tflite" # Or a direct OCR library (e.g., EasyOCR)
+
+# --- GPIO Pin Definitions ---
+IR_SENSOR_PIN = 23    # GPIO pin connected to the IR sensor (digital input)
+BARRIER_RELAY_PIN = 24 # GPIO pin connected to a relay for barrier control (digital output)
+
+# --- GPIO Setup ---
+GPIO.setmode(GPIO.BCM) # Use BCM numbering
+GPIO.setup(IR_SENSOR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP) # IR sensor, pull-up resistor
+GPIO.setup(BARRIER_RELAY_PIN, GPIO.OUT)
+GPIO.output(BARRIER_RELAY_PIN, GPIO.LOW) # Ensure barrier is down initially
+
+# --- Load TensorFlow Lite Interpreters ---
+try:
+    lpr_interpreter = tf.lite.Interpreter(model_path=LPR_DETECTION_MODEL_PATH)
+    lpr_interpreter.allocate_tensors()
+    lpr_input_details = lpr_interpreter.get_input_details()
+    lpr_output_details = lpr_interpreter.get_output_details()
+    logging.info(f"LPR Detection model loaded. Input: {lpr_input_details}, Output: {lpr_output_details}")
+
+    ocr_interpreter = tf.lite.Interpreter(model_path=OCR_MODEL_PATH)
+    ocr_interpreter.allocate_tensors()
+    ocr_input_details = ocr_interpreter.get_input_details()
+    ocr_output_details = ocr_interpreter.get_output_details()
+    logging.info(f"OCR model loaded. Input: {ocr_input_details}, Output: {ocr_output_details}")
+
+except Exception as e:
+    logging.error(f"Error loading AI models: {e}")
+    # In a real system, you might try to re-load or switch to a fallback
+    exit() # Critical error if models don't load
+
+# --- Camera Setup ---
+CAMERA_INDEX = 0 # Usually 0 for default webcam or Raspberry Pi Camera
+cap = cv2.VideoCapture(CAMERA_INDEX)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+if not cap.isOpened():
+    logging.error("Failed to open camera. Exiting.")
+    exit()
+
+# --- Global State for Parking Spots (conceptual for a small lot) ---
+# In a large system, this state would primarily be managed in Firebase.
+PARKING_SPOTS = {
+    "spot_01": {"occupied": False, "last_lp": None, "entry_time": None, "node_id": "parking_spot_node_01"},
+    "spot_02": {"occupied": False, "last_lp": None, "entry_time": None, "node_id": "parking_spot_node_02"},
+    # ... more spots
+}
+
+# --- Functions ---
+
+def detect_and_recognize_plate(frame):
+    """
+    Conceptual function to detect license plate using YOLOv8 TFLite model
+    and then recognize characters using OCR TFLite model.
+    """
+    # Preprocess frame for LPR detection model
+    input_shape = lpr_input_details[0]['shape']
+    img_resized = cv2.resize(frame, (input_shape[1], input_shape[2]))
+    input_data = np.expand_dims(img_resized.astype(np.float32) / 255.0, axis=0) # Normalize to 0-1
+
+    lpr_interpreter.set_tensor(lpr_input_details[0]['index'], input_data)
+    lpr_interpreter.invoke()
+
+    # Get detection results (boxes, classes, scores)
+    # The output structure depends on your specific YOLOv8 TFLite conversion
+    boxes = lpr_interpreter.get_tensor(lpr_output_details[0]['index'])[0] # Example output index
+    classes = lpr_interpreter.get_tensor(lpr_output_details[1]['index'])[0]
+    scores = lpr_interpreter.get_tensor(lpr_output_details[2]['index'])[0]
+    num_detections = int(lpr_interpreter.get_tensor(lpr_output_details[3]['index'])[0])
+
+    detected_plates = []
+    for i in range(num_detections):
+        if scores[i] > 0.6: # Confidence threshold
+            ymin, xmin, ymax, xmax = boxes[i] # Bounding box coordinates (normalized 0-1)
+            # Convert to pixel coordinates
+            H, W, _ = frame.shape
+            xmin = int(xmin * W)
+            ymin = int(ymin * H)
+            xmax = int(xmax * W)
+            ymax = int(ymax * H)
+
+            # Crop license plate region
+            lp_roi = frame[ymin:ymax, xmin:xmax]
+            if lp_roi.shape[0] > 0 and lp_roi.shape[1] > 0: # Ensure valid ROI
+                # --- Conceptual: OCR on cropped license plate ROI ---
+                # Preprocess lp_roi for OCR model
+                # ocr_input_shape = ocr_input_details[0]['shape']
+                # lp_resized = cv2.resize(lp_roi, (ocr_input_shape[1], ocr_input_shape[2]))
+                # ocr_input_data = np.expand_dims(lp_resized.astype(np.float32) / 255.0, axis=0)
+
+                # ocr_interpreter.set_tensor(ocr_input_details[0]['index'], ocr_input_data)
+                # ocr_interpreter.invoke()
+                # recognized_text = ocr_interpreter.get_tensor(ocr_output_details[0]['index']) # Get OCR result
+
+                # SIMULATE OCR result for demo:
+                simulated_lp_text = "AP39AA1234" # Placeholder for actual OCR result
+                if time.time() % 2 == 0: # Simulate some variation
+                    simulated_lp_text = "KA01BB5678"
+
+                detected_plates.append({
+                    "plate_text": simulated_lp_text,
+                    "confidence": float(scores[i]),
+                    "bbox": [xmin, ymin, xmax, ymax]
+                })
+                return detected_plates # Return first confident detection for simplicity
+
+    return detected_plates # Empty if no plate detected
+
+def read_ir_sensor(pin):
+    """Reads the state of an IR sensor."""
+    # IR sensor typically HIGH when no object, LOW when object detected
+    return not GPIO.input(pin) # Returns True if occupied (LOW), False if empty (HIGH)
+
+def open_barrier():
+    """Opens the parking barrier (activates relay)."""
+    logging.info("Opening barrier...")
+    GPIO.output(BARRIER_RELAY_PIN, GPIO.HIGH) # Activate relay
+    time.sleep(3) # Keep open for a few seconds
+    GPIO.output(BARRIER_RELAY_PIN, GPIO.LOW)  # Deactivate relay (close barrier)
+    logging.info("Barrier closed.")
+
+def log_parking_event(event_type, parking_spot_id=None, license_plate=None):
+    """Logs parking events to Firebase."""
+    if cloud_db_ref is None:
+        logging.error("Firebase not initialized. Cannot log event.")
+        return
+
+    event_data = {
+        "nodeId": NODE_ID,
+        "parkingLotId": PARKING_LOT_ID,
+        "timestamp": datetime.now().isoformat(), # ISO format for consistent time
+        "eventType": event_type, # e.g., "vehicle_entry", "vehicle_exit", "spot_occupied", "spot_vacant"
+    }
+    if parking_spot_id:
+        event_data["parkingSpotId"] = parking_spot_id
+    if license_plate:
+        event_data["licensePlate"] = license_plate
+
+    try:
+        cloud_db_ref.child('parking_events').push(event_data)
+        logging.info(f"Logged event to Firebase: {event_type} - {license_plate or parking_spot_id}")
+    except Exception as e:
+        logging.error(f"Failed to log event to Firebase: {e}")
+
+def update_spot_status(spot_id, is_occupied, license_plate=None):
+    """Updates parking spot status in Firebase."""
+    if cloud_db_ref is None:
+        logging.error("Firebase not initialized. Cannot update spot status.")
+        return
+
+    spot_data = {
+        "occupied": is_occupied,
+        "lastUpdated": datetime.now().isoformat(),
+        "licensePlate": license_plate if is_occupied else None,
+        "entryTime": datetime.now().isoformat() if is_occupied else None,
+        "nodeId": NODE_ID # For linking spot to its sensor node
+    }
+    try:
+        cloud_db_ref.child('parking_spots').child(PARKING_LOT_ID).child(spot_id).update(spot_data)
+        logging.info(f"Updated spot {spot_id} to occupied: {is_occupied}")
+    except Exception as e:
+        logging.error(f"Failed to update spot status in Firebase: {e}")
+
+
+# --- Main Loop ---
+def run_parking_system():
+    last_ir_status = False # Track previous IR sensor state
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                logging.warning("Failed to grab camera frame. Retrying...")
+                time.sleep(1)
+                continue
+
+            # --- LPR Processing (for entry/exit points) ---
+            detected_plates = detect_and_recognize_plate(frame)
+            if detected_plates:
+                plate_info = detected_plates[0] # Take the first detected plate
+                logging.info(f"Detected License Plate: {plate_info['plate_text']} (Conf: {plate_info['confidence']:.2f})")
+                log_parking_event("vehicle_detected", license_plate=plate_info['plate_text'])
+                
+                # Example: If this is an entry gate and plate is recognized, open barrier
+                # In a real system, you'd check a whitelist/blacklist or payment status
+                if NODE_ID == "entry_exit_node_001": # If this node is at an entry point
+                    # Simulate decision: allow entry if plate is not blacklisted
+                    if "GA00XYZ000" not in plate_info['plate_text']: # Simple blacklist example
+                        logging.info(f"Allowed entry for {plate_info['plate_text']}")
+                        # open_barrier() # Uncomment to activate barrier
+                        log_parking_event("vehicle_entry", license_plate=plate_info['plate_text'])
+                    else:
+                        logging.warning(f"Denied entry for blacklisted plate: {plate_info['plate_text']}")
+
+
+            # --- IR Sensor Monitoring (for individual spots or barrier detection) ---
+            current_ir_status = read_ir_sensor(IR_SENSOR_PIN)
+            if current_ir_status != last_ir_status:
+                if current_ir_status: # Sensor now detects object (vehicle present)
+                    logging.info(f"IR Sensor {IR_SENSOR_PIN}: Vehicle Detected!")
+                    # This would typically be for a specific spot, e.g., "spot_01"
+                    update_spot_status("spot_01", True, license_plate=detected_plates[0]['plate_text'] if detected_plates else None)
+                    log_parking_event("spot_occupied", parking_spot_id="spot_01", license_plate=detected_plates[0]['plate_text'] if detected_plates else None)
+                else: # Sensor no longer detects object (vehicle left)
+                    logging.info(f"IR Sensor {IR_SENSOR_PIN}: Spot Vacant!")
+                    update_spot_status("spot_01", False)
+                    log_parking_event("spot_vacant", parking_spot_id="spot_01", license_plate=detected_plates[0]['plate_text'] if detected_plates else None) # Log exit if LP was known
+                last_ir_status = current_ir_status
+
+            # --- Display Frame (Optional, for debugging) ---
+            cv2.imshow('Parking System Cam', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+            time.sleep(0.1) # Small delay
+
+    except KeyboardInterrupt:
+        logging.info("Parking system stopping...")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        GPIO.cleanup() # Clean up GPIO settings
+        logging.info("Resources released.")
+
+if __name__ == "__main__":
+    run_parking_system()
+2. Firebase Database Structure (Conceptual JSON)
+This shows how data would be organized in Firebase for real-time updates and historical logging.
+
+JSON
+
+{
+  "parking_lots": {
+    "lot_A": {
+      "name": "Downtown Parking Garage",
+      "total_capacity": 500,
+      "available_spots": 450,
+      "last_updated": "2025-06-17T14:30:00Z"
+    }
+  },
+  "parking_spots": {
+    "lot_A": {
+      "spot_01": {
+        "occupied": true,
+        "lastUpdated": "2025-06-17T14:28:15Z",
+        "licensePlate": "AP39AA1234",
+        "entryTime": "2025-06-17T14:00:00Z",
+        "nodeId": "parking_spot_node_01"
+      },
+      "spot_02": {
+        "occupied": false,
+        "lastUpdated": "2025-06-17T14:29:05Z",
+        "licensePlate": null,
+        "entryTime": null,
+        "nodeId": "parking_spot_node_02"
+      },
+      // ... more spots
+    }
+  },
+  "parking_events": {
+    "auto_id_1": {
+      "nodeId": "entry_exit_node_001",
+      "parkingLotId": "lot_A",
+      "timestamp": "2025-06-17T14:00:00Z",
+      "eventType": "vehicle_entry",
+      "licensePlate": "AP39AA1234"
+    },
+    "auto_id_2": {
+      "nodeId": "parking_spot_node_01",
+      "parkingLotId": "lot_A",
+      "timestamp": "2025-06-17T14:00:10Z",
+      "eventType": "spot_occupied",
+      "parkingSpotId": "spot_01",
+      "licensePlate": "AP39AA1234"
+    },
+    "auto_id_3": {
+      "nodeId": "parking_spot_node_01",
+      "parkingLotId": "lot_A",
+      "timestamp": "2025-06-17T14:28:00Z",
+      "eventType": "spot_vacant",
+      "parkingSpotId": "spot_01",
+      "licensePlate": "AP39AA1234" // Optionally record exiting plate
+    }
+  },
+  "predictive_allocation": {
+    "lot_A": {
+      "hourly_forecast": {
+        "2025-06-17T15:00:00Z": { "predicted_occupancy": 0.85, "estimated_vacancies": 75 },
+        "2025-06-17T16:00:00Z": { "predicted_occupancy": 0.92, "estimated_vacancies": 40 }
+      },
+      "daily_trends": { /* ... */ }
+    }
+  }
+}
