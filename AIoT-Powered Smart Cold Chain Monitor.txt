@@ -1,0 +1,442 @@
+Conceptual Code Snippets for AIoT-Powered Smart Cold Chain Monitor
+1. ESP32 Firmware (main.ino - Arduino C++)
+This code assumes you have the necessary libraries installed in your Arduino IDE (e.g., DHT sensor library for ESPx, TinyGPS++, PubSubClient for MQTT, ArduinoJson, WiFiClientSecure for AWS IoT).
+
+C++
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h> // For MQTT
+#include "DHT.h"          // For DHT22 sensor
+#include <TinyGPS++.h>    // For GPS module
+#include <HardwareSerial.h> // For GPS UART
+
+// --- AWS IoT Core Configuration ---
+#define AWS_IOT_PUBLISH_TOPIC "coldchain/data"
+#define AWS_IOT_SUBSCRIBE_TOPIC "coldchain/commands" // Optional for device control
+#define CLIENT_ID "esp32_coldchain_monitor_001" // Unique Client ID for this device
+
+// Replace with your WiFi credentials
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// Replace with your AWS IoT Core Endpoint
+const char* aws_iot_endpoint = "YOUR_AWS_IOT_ENDPOINT.iot.your-region.amazonaws.com";
+
+// AWS IoT Certificates (Copy from your AWS IoT Console -> Security -> Certificates -> Your Cert -> Download)
+// Store these securely, ideally on the ESP32's SPIFFS or PROGMEM for production
+// For simplicity, hardcoding here (NOT recommended for production)
+const char* aws_root_ca =
+  "-----BEGIN CERTIFICATE-----\n"
+  "...\n" // YOUR AWS ROOT CA CERTIFICATE CONTENT
+  "----END CERTIFICATE-----\n";
+
+const char* certificate_pem_crt =
+  "-----BEGIN CERTIFICATE-----\n"
+  "...\n" // YOUR DEVICE CERTIFICATE CONTENT
+  "----END CERTIFICATE-----\n";
+
+const char* private_pem_key =
+  "-----BEGIN RSA PRIVATE KEY-----\n"
+  "...\n" // YOUR DEVICE PRIVATE KEY CONTENT
+  "----END RSA PRIVATE KEY-----\n";
+
+WiFiClientSecure net;
+PubSubClient client(net);
+
+// --- DHT22 Sensor Configuration ---
+#define DHTPIN 4     // DHT data pin (e.g., GPIO 4)
+#define DHTTYPE DHT22   // DHT 22  (AM2302), AM2321
+DHT dht(DHTPIN, DHTTYPE);
+
+// --- GPS Module Configuration (e.g., NEO-6M on ESP32 UART2) ---
+// Connect GPS TX to ESP32 RX2 (GPIO 16)
+// Connect GPS RX to ESP32 TX2 (GPIO 17)
+HardwareSerial gpsSerial(2); // Use UART2
+TinyGPSPlus gps;
+
+// --- Timers for publishing ---
+long lastMsg = 0;
+const int PUBLISH_INTERVAL_MS = 60000; // Publish every 60 seconds
+
+void connectAWS();
+void messageHandler(char* topic, byte* payload, unsigned int length);
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Booting...");
+
+  // Initialize DHT sensor
+  dht.begin();
+  Serial.println("DHT sensor initialized.");
+
+  // Initialize GPS serial
+  gpsSerial.begin(9600, SERIAL_8N1, 16, 17); // Baud rate, config, RX pin, TX pin
+  Serial.println("GPS serial initialized.");
+
+  // Connect to Wi-Fi
+  Serial.printf("Connecting to %s ", ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("CONNECTED");
+
+  // Configure MQTT client with AWS IoT certificates
+  net.setCACert(aws_root_ca);
+  net.setCertificate(certificate_pem_crt);
+  net.setPrivateKey(private_pem_key);
+
+  client.setServer(aws_iot_endpoint, 8883); // AWS IoT uses port 8883 for MQTTS
+  client.setCallback(messageHandler);
+
+  connectAWS();
+}
+
+void loop() {
+  if (!client.connected()) {
+    connectAWS();
+  }
+  client.loop(); // Maintain MQTT connection
+
+  // Process GPS data
+  while (gpsSerial.available() > 0) {
+    if (gps.encode(gpsSerial.read())) {
+      // Data updated, optionally print here
+      // Serial.printf("Lat: %f, Lng: %f\n", gps.location.lat(), gps.location.lng());
+    }
+  }
+
+  long now = millis();
+  if (now - lastMsg > PUBLISH_INTERVAL_MS) {
+    lastMsg = now;
+
+    // Read sensor data
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+    // Check if any reads failed and exit early (to try again).
+    if (isnan(h) || isnan(t)) {
+      Serial.println(F("Failed to read from DHT sensor!"));
+      return;
+    }
+
+    // Prepare JSON payload
+    char jsonBuffer[512];
+    snprintf(jsonBuffer, sizeof(jsonBuffer),
+             "{\"deviceId\": \"%s\", \"timestamp\": %lu, \"temperature\": %.2f, \"humidity\": %.2f, \"latitude\": %.6f, \"longitude\": %.6f, \"altitude\": %.2f}",
+             CLIENT_ID,
+             millis(), // Or use NTP for real timestamp
+             t,
+             h,
+             gps.location.isValid() ? gps.location.lat() : 0.0,
+             gps.location.isValid() ? gps.location.lng() : 0.0,
+             gps.altitude.isValid() ? gps.altitude.meters() : 0.0
+            );
+
+    Serial.printf("Publishing: %s\n", jsonBuffer);
+    client.publish(AWS_IOT_PUBLISH_TOPIC, jsonBuffer);
+  }
+}
+
+void connectAWS() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect(CLIENT_ID)) {
+      Serial.println("connected");
+      client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC); // Subscribe to command topic
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+void messageHandler(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+  // Handle commands from cloud, e.g., change publish interval, restart, etc.
+}
+2. AWS Lambda Function (lambda_function.py - Python)
+This Lambda function acts as the bridge between AWS IoT Core and SageMaker/DynamoDB/S3.
+
+Python
+
+import json
+import os
+import boto3
+import datetime
+import logging
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+# AWS clients
+iot_data_client = boto3.client('iot-data')
+sagemaker_runtime_client = boto3.client('sagemaker-runtime')
+dynamodb = boto3.resource('dynamodb') # For storing raw data
+sns_client = boto3.client('sns') # For sending alerts
+
+# Environment variables (set in Lambda configuration)
+SAGEMAKER_ENDPOINT_NAME = os.environ.get('SAGEMAKER_ENDPOINT_NAME', 'your-sagemaker-endpoint-name')
+DYNAMODB_TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME', 'ColdChainData')
+SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN', 'arn:aws:sns:your-region:your-account-id:ColdChainAlerts')
+
+def lambda_handler(event, context):
+    logger.info(f"Received event: {json.dumps(event)}")
+
+    try:
+        # Assuming event payload is directly from AWS IoT Core MQTT message
+        payload = event
+        
+        device_id = payload.get('deviceId')
+        timestamp = payload.get('timestamp') # This is millis from ESP32, convert to Unix Epoch
+        temperature = payload.get('temperature')
+        humidity = payload.get('humidity')
+        latitude = payload.get('latitude')
+        longitude = payload.get('longitude')
+        altitude = payload.get('altitude')
+
+        if not all([device_id, timestamp, temperature, humidity, latitude, longitude]):
+            logger.warning("Missing required fields in payload.")
+            return {
+                'statusCode': 400,
+                'body': json.dumps('Missing required fields')
+            }
+
+        # Convert ESP32 millis to ISO format for consistent storage
+        event_time_ms = int(timestamp)
+        # Assuming timestamp is milliseconds since ESP32 boot, not Unix epoch
+        # For real-time, consider using NTP on ESP32 or adding a Lambda-side timestamp
+        current_utc_time = datetime.datetime.utcnow().isoformat() + 'Z' # Use Lambda's time for accuracy
+
+        # 1. Store raw data in DynamoDB (or Timestream/S3)
+        table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+        item = {
+            'deviceId_timestamp': f"{device_id}#{current_utc_time}", # Composite primary key
+            'deviceId': device_id,
+            'timestamp_iso': current_utc_time,
+            'temperature': temperature,
+            'humidity': humidity,
+            'latitude': latitude,
+            'longitude': longitude,
+            'altitude': altitude,
+            'raw_event': json.dumps(payload)
+        }
+        table.put_item(Item=item)
+        logger.info(f"Data stored in DynamoDB for device {device_id}")
+
+        # 2. Prepare data for SageMaker inference
+        # SageMaker expects a specific format, typically CSV or JSON Lines
+        # For a time-series autoencoder, you might pass a window of recent data
+        # For simplicity, sending current point for immediate anomaly check
+        inference_data = {
+            "instances": [
+                {"features": [temperature, humidity, latitude, longitude]} # Features for the model
+                # In a real scenario, you'd send a window of recent readings for time-series anomaly detection
+            ]
+        }
+        
+        # Invoke SageMaker Endpoint
+        response = sagemaker_runtime_client.invoke_endpoint(
+            EndpointName=SAGEMAKER_ENDPOINT_NAME,
+            ContentType='application/json',
+            Body=json.dumps(inference_data)
+        )
+        
+        result = json.loads(response['Body'].read().decode('utf-8'))
+        
+        # Assuming the model returns an 'anomaly_score' or 'is_anomaly'
+        anomaly_score = result.get('anomaly_score')
+        is_anomaly = anomaly_score > 0.8 # Example threshold
+
+        logger.info(f"SageMaker Inference Result for {device_id}: Anomaly Score={anomaly_score}, Is Anomaly={is_anomaly}")
+
+        # 3. Alerting if anomaly detected or conditions are outside safe range
+        if is_anomaly:
+            message = (f"COLD CHAIN ANOMALY DETECTED for Device {device_id}!\n"
+                       f"Timestamp: {current_utc_time}\n"
+                       f"Temperature: {temperature}°C, Humidity: {humidity}%\n"
+                       f"Location: Lat {latitude}, Lon {longitude}\n"
+                       f"Anomaly Score: {anomaly_score:.2f}")
+            
+            sns_client.publish(
+                TopicArn=SNS_TOPIC_ARN,
+                Message=message,
+                Subject=f"CRITICAL: Cold Chain Anomaly on Device {device_id}"
+            )
+            logger.warning(f"Anomaly alert sent for device {device_id}")
+
+        # Example: Direct threshold check (can be done in addition to AI)
+        if temperature < 2 or temperature > 8: # Example: 2-8°C for pharmaceuticals
+             message = (f"COLD CHAIN THRESHOLD BREACH for Device {device_id}!\n"
+                       f"Timestamp: {current_utc_time}\n"
+                       f"Temperature: {temperature}°C, Humidity: {humidity}%\n"
+                       f"Location: Lat {latitude}, Lon {longitude}")
+             sns_client.publish(
+                TopicArn=SNS_TOPIC_ARN,
+                Message=message,
+                Subject=f"ALERT: Cold Chain Temperature Breach on Device {device_id}"
+            )
+             logger.warning(f"Threshold breach alert sent for device {device_id}")
+
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Data processed and inference completed.')
+        }
+
+    except Exception as e:
+        logger.error(f"Error processing event: {e}", exc_info=True)
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Error processing request: {str(e)}')
+        }
+3. SageMaker Autoencoder (Conceptual Python/TensorFlow/Keras)
+This outlines the core idea. Training would happen in a SageMaker Notebook instance, and then the model would be deployed as an endpoint.
+
+Python
+
+# This code would be part of your SageMaker training script
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+
+# --- 1. Data Preparation (Conceptual) ---
+# Load your historical cold chain data (temperature, humidity, location)
+# This data should represent "normal" operating conditions.
+# Example: df = pd.read_csv('s3://your-bucket/cold_chain_normal_data.csv')
+# Features to use for anomaly detection
+features = ['temperature', 'humidity', 'latitude', 'longitude']
+# Assuming your data is already preprocessed and clean
+# Data collection from historical cold chain logs where conditions were known to be normal.
+# e.g., pd.DataFrame({'temperature': [...], 'humidity': [...], 'latitude': [...], 'longitude': [...]})
+normal_data = np.random.rand(1000, len(features)) * 10 + np.array([5, 50, 17.6, 83.2]) # Simulated normal data
+
+# Scale the data
+scaler = StandardScaler()
+scaled_normal_data = scaler.fit_transform(normal_data)
+
+# Split data (if training from scratch, otherwise use all normal data for training)
+X_train, X_test = train_test_split(scaled_normal_data, test_size=0.2, random_state=42)
+
+
+# --- 2. Autoencoder Model Definition ---
+input_dim = X_train.shape[1] # Number of features
+
+# Encoder
+input_layer = Input(shape=(input_dim,))
+encoder = Dense(input_dim // 2, activation="relu")(input_layer)
+encoder = Dense(input_dim // 4, activation="relu")(encoder) # Bottleneck layer (latent space)
+
+# Decoder
+decoder = Dense(input_dim // 2, activation="relu")(encoder)
+decoder = Dense(input_dim, activation="linear")(decoder) # Output layer matches input dimensions
+
+autoencoder = Model(inputs=input_layer, outputs=decoder)
+
+# Compile the model
+autoencoder.compile(optimizer='adam', loss='mse') # Mean Squared Error is common for reconstruction error
+
+# --- 3. Model Training ---
+# Train on your normal data
+history = autoencoder.fit(X_train, X_train,
+                          epochs=50, # Adjust epochs as needed
+                          batch_size=32, # Adjust batch size
+                          validation_data=(X_test, X_test),
+                          callbacks=[EarlyStopping(monitor='val_loss', patience=5, mode='min')],
+                          verbose=2) # Set verbose=0 for silent training
+
+# --- 4. Determine Anomaly Threshold ---
+# After training, calculate reconstruction error on the normal training data
+reconstructions = autoencoder.predict(scaled_normal_data)
+mse = np.mean(np.power(scaled_normal_data - reconstructions, 2), axis=1)
+
+# A common approach is to set the threshold based on a percentile (e.g., 95th or 99th)
+# of the reconstruction errors on normal data.
+# anomaly_threshold = np.percentile(mse, 99) # Adjust percentile
+# print(f"Determined Anomaly Threshold: {anomaly_threshold}")
+
+# This threshold would be used in the Lambda function or the inference endpoint logic.
+# For a deployed endpoint, the inference code would predict reconstruction error and compare.
+
+
+# --- 5. SageMaker Model Deployment (Conceptual) ---
+# In a SageMaker notebook, you would typically save the model and deploy it.
+# autoencoder.save('model.h5') # Save the Keras model
+
+# from sagemaker.tensorflow.model import TensorFlowModel
+# sagemaker_model = TensorFlowModel(
+#     model_data='s3://your-bucket/model.tar.gz', # Your saved model artifacts
+#     role='your-sagemaker-execution-role-arn',
+#     framework_version='2.X', # Keras/TF version
+#     py_version='py3'
+# )
+# predictor = sagemaker_model.deploy(
+#     initial_instance_count=1,
+#     instance_type='ml.t2.medium',
+#     endpoint_name=SAGEMAKER_ENDPOINT_NAME # Use the same name as in Lambda
+# )
+
+# --- 6. Inference Function for SageMaker Endpoint (Conceptual) ---
+# This code would be inside the 'code' directory for your SageMaker Endpoint
+# (e.g., in a script called 'inference.py')
+# It receives input, performs prediction, and returns output.
+
+"""
+# inference.py content
+import json
+import numpy as np
+import tensorflow as tf
+from sklearn.preprocessing import StandardScaler # You'd need to save/load this too
+
+def model_fn(model_dir):
+    # Load the Keras model
+    model = tf.keras.models.load_model(model_dir)
+    # Load the scaler (critical for consistent preprocessing)
+    # You'd need to save the fitted scaler during training and load it here.
+    # For simplicity, assuming a global scaler or passed via environment variables.
+    global scaler # This is highly simplified
+    scaler = StandardScaler() # In real scenario, load persisted scaler
+    scaler.mean_ = np.array([5.0, 50.0, 17.6, 83.2]) # Placeholder, load real mean/std
+    scaler.scale_ = np.array([1.0, 10.0, 0.1, 0.1])
+    return model
+
+def input_fn(request_body, request_content_type):
+    if request_content_type == 'application/json':
+        data = json.loads(request_body)['instances']
+        return np.array([instance['features'] for instance in data])
+    raise ValueError(f"Unsupported content type: {request_content_type}")
+
+def predict_fn(input_data, model):
+    scaled_input_data = scaler.transform(input_data) # Apply same scaling as during training
+    reconstructions = model.predict(scaled_input_data)
+    mse = np.mean(np.power(scaled_input_data - reconstructions, 2), axis=1)
+    
+    # Define your anomaly threshold here (e.g., from a configuration)
+    # anomaly_threshold_for_inference = 0.5 # Load this from model artifacts or env var
+    
+    # For a simple autoencoder, the higher the MSE, the more anomalous.
+    # The endpoint can return the MSE, and the Lambda function decides on the threshold.
+    return {'anomaly_score': mse.tolist()}
+
+def output_fn(prediction, accept_content_type):
+    if accept_content_type == 'application/json':
+        return json.dumps(prediction), accept_content_type
+    raise ValueError(f"Unsupported accept type: {accept_content_type}")
+"""
