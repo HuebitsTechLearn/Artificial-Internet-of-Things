@@ -1,0 +1,320 @@
+Conceptual Code Snippets for Self-Adaptive Smart Irrigation System
+1. Arduino Sketch (main.ino - C++)
+This code assumes you have the necessary libraries installed in your Arduino IDE (e.g., DHT sensor library, Adafruit_Sensor, TinyGSM or a specific GSM library for your module, ArduinoJson).
+
+C++
+
+#include <DHT.h>          // For DHT11 sensor
+#include <SoftwareSerial.h> // For GSM module (if using non-hardware serial pins)
+#include <ArduinoJson.h>    // For creating JSON payloads
+#include <avr/sleep.h>      // For low power modes (if implementing)
+
+// --- Sensor Pin Definitions ---
+#define DHTPIN 2          // DHT11 Data Pin (e.g., Digital Pin 2)
+#define SOIL_MOISTURE_PIN A0 // Soil Moisture Analog Pin (e.g., Analog Pin A0)
+#define RELAY_PIN 7       // Relay Control Pin (e.g., Digital Pin 7)
+
+// --- DHT11 Sensor Setup ---
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// --- GSM Module Setup ---
+// Adjust RX/TX pins based on your wiring. Using SoftwareSerial for flexibility.
+#define GSM_RX_PIN 10
+#define GSM_TX_PIN 11
+SoftwareSerial gsmSerial(GSM_RX_PIN, GSM_TX_PIN);
+
+// --- Azure IoT Hub (Simplified GSM/MQTT Client - conceptual) ---
+// In reality, this is complex. You'd likely use a robust GSM library with MQTT capabilities
+// or a dedicated Azure IoT SDK for ESP32/ESP8266 if not using Arduino Uno/Mega.
+// For Arduino Uno/Mega with GSM, you'd send AT commands for GPRS/TCP/MQTT connection.
+#define AZURE_IOT_HUB_HOSTNAME "YOUR_IOT_HUB_NAME.azure-devices.net"
+#define DEVICE_ID "irrigationNode001"
+#define SAS_TOKEN "YOUR_SAS_TOKEN_GENERATED_SECURELY" // Production: regenerate periodically
+#define MQTT_TOPIC_TELEMETRY "devices/" DEVICE_ID "/messages/events/" // Default Azure IoT telemetry topic
+#define MQTT_TOPIC_COMMANDS "devices/" DEVICE_ID "/messages/devicebound/#" // For D2C commands
+
+long lastMsgTime = 0;
+const int PUBLISH_INTERVAL_MS = 300000; // Publish every 5 minutes (300 seconds)
+
+void setup() {
+  Serial.begin(9600);
+  gsmSerial.begin(9600); // GSM module baud rate
+
+  Serial.println(F("Initializing DHT11..."));
+  dht.begin();
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW); // Ensure pump is off initially
+
+  Serial.println(F("Attempting to connect to GSM network..."));
+  // --- GSM Initialization (Conceptual - involves many AT commands) ---
+  // You would send AT commands here to connect to GPRS, get IP, establish TCP, then MQTT.
+  // Example (simplified):
+  // gsmSerial.println("AT"); delay(1000); // Check AT
+  // gsmSerial.println("AT+CSQ"); delay(1000); // Signal quality
+  // gsmSerial.println("AT+CREG?"); delay(1000); // Network registration
+  // gsmSerial.println("AT+CSTT=\"APN_NAME\",\"USERNAME\",\"PASSWORD\""); delay(2000); // Set APN
+  // gsmSerial.println("AT+CIICR"); delay(5000); // Bring up wireless connection
+  // gsmSerial.println("AT+CIFSR"); delay(2000); // Get IP address
+  // ... and then AT commands for MQTT connection
+  Serial.println(F("GSM module initialized (conceptual)."));
+
+  Serial.println(F("Ready to send data."));
+}
+
+void loop() {
+  // --- Read Sensor Data ---
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  int soilMoistureRaw = analogRead(SOIL_MOISTURE_PIN);
+  // Convert raw soil moisture to percentage (calibration needed)
+  // Assuming 0 is dry, 1023 is wet for a typical sensor
+  float soilMoisture = map(soilMoistureRaw, 0, 1023, 100, 0); // Invert for 100% wet, 0% dry
+
+  // Check if sensor readings are valid
+  if (isnan(h) || isnan(t)) {
+    Serial.println(F("Failed to read from DHT sensor!"));
+    // Consider re-attempt or error handling
+  } else {
+    Serial.print(F("Temperature: ")); Serial.print(t); Serial.print(F(" °C, Humidity: ")); Serial.print(h); Serial.print(F(" %"));
+    Serial.print(F(", Soil Moisture: ")); Serial.print(soilMoisture); Serial.println(F(" %"));
+  }
+
+  long now = millis();
+  if (now - lastMsgTime > PUBLISH_INTERVAL_MS) {
+    lastMsgTime = now;
+
+    // --- Prepare JSON Payload for Azure IoT Hub ---
+    StaticJsonDocument<200> doc;
+    doc["deviceId"] = DEVICE_ID;
+    doc["timestamp"] = now; // Use millis() or RTC/NTP for real time
+    doc["temperature"] = t;
+    doc["humidity"] = h;
+    doc["soilMoisture"] = soilMoisture;
+    // Add GPS data if available
+    // doc["latitude"] = gps.location.lat();
+    // doc["longitude"] = gps.location.lng();
+
+    char jsonBuffer[256];
+    serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
+
+    Serial.print(F("Sending message to Azure IoT Hub: "));
+    Serial.println(jsonBuffer);
+
+    // --- Send data via GSM MQTT (Conceptual) ---
+    // In a real scenario, this involves GSM AT commands to publish MQTT message
+    // gsmClient.publish(MQTT_TOPIC_TELEMETRY, jsonBuffer);
+    Serial.println(F("Message sent (conceptual)."));
+  }
+
+  // --- Check for Commands from Azure IoT Hub (Conceptual) ---
+  // This would involve polling the GSM module for incoming MQTT messages
+  // and parsing them. If a command to turn on/off pump is received:
+  // if (commandReceived == "TURN_ON_PUMP") {
+  //   digitalWrite(RELAY_PIN, HIGH);
+  //   Serial.println("Pump ON");
+  // } else if (commandReceived == "TURN_OFF_PUMP") {
+  //   digitalWrite(RELAY_PIN, LOW);
+  //   Serial.println("Pump OFF");
+  // }
+
+  delay(1000); // Small delay to prevent busy-looping
+}
+2. Azure Function (__init__.py - Python)
+This function is triggered by messages coming into Azure IoT Hub.
+
+Python
+
+import logging
+import json
+import os
+import azure.functions as func
+from azure.iot.hub import IoTHubRegistryManager
+from azure.iot.hub.protocol.iot_hub_error import IoTHubError
+
+import requests # For calling Azure ML Endpoint
+import pandas as pd # For preparing data for ML endpoint
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Environment variables (set in Azure Function app settings)
+AZURE_ML_ENDPOINT_URL = os.environ.get('AZURE_ML_ENDPOINT_URL', 'YOUR_AZURE_ML_ENDPOINT_URL')
+AZURE_ML_API_KEY = os.environ.get('AZURE_ML_API_KEY', 'YOUR_AZURE_ML_API_KEY')
+IOTHUB_CONNECTION_STRING = os.environ.get('IOTHUB_CONNECTION_STRING', 'YOUR_IOTHUB_CONNECTION_STRING') # For sending C2D messages
+
+# Initialize IoT Hub Registry Manager for C2D messages
+try:
+    registry_manager = IoTHubRegistryManager.from_connection_string(IOTHUB_CONNECTION_STRING)
+    logging.info("IoTHubRegistryManager initialized.")
+except Exception as e:
+    logging.error(f"Error initializing IoTHubRegistryManager: {e}")
+
+def main(event: func.EventHubEvent):
+    logging.info('Python Event Hub trigger function processed a request.')
+
+    for message in event.get_body():
+        try:
+            # Decode the message body (from bytes to string, then JSON)
+            message_body = message.decode('utf-8')
+            data = json.loads(message_body)
+            logging.info(f"Received message: {data}")
+
+            device_id = data.get('deviceId')
+            temperature = data.get('temperature')
+            humidity = data.get('humidity')
+            soil_moisture = data.get('soilMoisture')
+            # Add latitude, longitude if available
+
+            if not all([device_id, temperature, humidity, soil_moisture]):
+                logging.warning(f"Skipping incomplete message from {device_id}")
+                continue
+
+            # 1. Prepare data for Azure ML (XGBoost) inference
+            # The input format for your deployed model might vary.
+            # Assuming a simple JSON input with features.
+            input_df = pd.DataFrame([{
+                'temperature': temperature,
+                'humidity': humidity,
+                'soilMoisture': soil_moisture,
+                # Add other features like 'cropType', 'growthStage', 'rainfall_forecast', etc.
+                # For a real system, you'd integrate weather API data and crop info here.
+                'cropType_encoded': 1, # Example: 1 for Wheat, 2 for Corn
+                'growthStage_encoded': 3 # Example: 1-Seedling, 2-Vegetative, 3-Flowering
+            }])
+            
+            # Convert DataFrame to JSON for Azure ML endpoint
+            inference_input = input_df.to_json(orient='split') # Or 'records', depending on endpoint
+            
+            headers = {
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {AZURE_ML_API_KEY}',
+                "azureml-model-deployment": "YOUR_AZURE_ML_DEPLOYMENT_NAME" # Often required for specific deployments
+            }
+
+            # 2. Call Azure ML Endpoint for optimal water prediction
+            try:
+                response = requests.post(AZURE_ML_ENDPOINT_URL, headers=headers, data=inference_input)
+                response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+                prediction_result = response.json()
+                
+                # Assuming the model returns 'optimal_water_ml' in its prediction
+                optimal_water_ml = prediction_result.get('result', [0])[0] # Get the first prediction
+                logging.info(f"Azure ML predicted optimal water for {device_id}: {optimal_water_ml} units.")
+
+                # 3. Decision Logic: Determine if irrigation is needed and send command
+                command_to_send = ""
+                # This logic is highly simplified. A real system would consider:
+                # - Optimal water amount vs. current soil moisture capacity
+                # - Time since last irrigation
+                # - Rainfall forecast
+                # - Current state of the pump (to avoid redundant commands)
+
+                if soil_moisture < 40 and optimal_water_ml > 0.1: # Example logic: dry and ML says water
+                    command_to_send = "TURN_ON_PUMP"
+                elif soil_moisture > 70 or optimal_water_ml <= 0.1:
+                    command_to_send = "TURN_OFF_PUMP"
+
+                if command_to_send:
+                    # Send C2D message to the device
+                    try:
+                        registry_manager.send_c2d_message(
+                            device_id,
+                            json.dumps({"command": command_to_send})
+                        )
+                        logging.info(f"Sent command '{command_to_send}' to device {device_id}")
+                    except IoTHubError as e:
+                        logging.error(f"Error sending C2D message to {device_id}: {e}")
+
+                # Optional: Store prediction and command in another Azure DB for history
+                # E.g., table.put_item(Item={...}) for DynamoDB or insert into SQL DB
+
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Error calling Azure ML Endpoint: {e}")
+            except json.JSONDecodeError:
+                logging.error(f"Failed to parse ML response: {response.text}")
+
+        except json.JSONDecodeError:
+            logging.error(f"Could not decode JSON from message: {message_body}")
+        except Exception as e:
+            logging.error(f"Error processing message: {e}", exc_info=True)
+
+3. XGBoost Model Training (Conceptual Python Script - for Azure ML)
+This is a simplified training script that you would run within an Azure ML workspace (e.g., in a notebook or as part of an Azure ML Pipeline).
+
+Python
+
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+import joblib # For saving the model
+
+# --- 1. Load and Prepare Data ---
+# This data would come from historical sensor readings, weather data, and actual water applied,
+# along with observed crop health/yield for supervised learning.
+# Features: soil_moisture, temperature, humidity, rainfall_yesterday, crop_type_encoded, growth_stage_encoded, etc.
+# Target: optimal_water_needed (e.g., liters/sq_meter, or irrigation duration)
+
+# Simulated data for demonstration
+data = {
+    'soil_moisture': np.random.uniform(0, 100, 1000),
+    'temperature': np.random.uniform(15, 40, 1000),
+    'humidity': np.random.uniform(30, 90, 1000),
+    'rainfall_yesterday': np.random.uniform(0, 50, 1000),
+    'crop_type_encoded': np.random.randint(1, 4, 1000), # 1:Wheat, 2:Corn, 3:Rice
+    'growth_stage_encoded': np.random.randint(1, 5, 1000), # 1:Seedling, 2:Vegetative, 3:Flowering, 4:Maturity
+    'optimal_water_needed': [] # This is what we'll predict
+}
+
+df = pd.DataFrame(data)
+
+# Create a simplistic 'optimal_water_needed' based on features
+# In real life, this would be derived from expert knowledge, experimentation, or historical yield data.
+df['optimal_water_needed'] = (
+    50 - (df['soil_moisture'] * 0.4) +
+    (df['temperature'] * 0.5) -
+    (df['humidity'] * 0.1) +
+    (df['growth_stage_encoded'] * 2) -
+    (df['rainfall_yesterday'] * 0.8) +
+    (df['crop_type_encoded'] * 5) + # Different crops need different water
+    np.random.normal(0, 5, 1000) # Add some noise
+)
+df['optimal_water_needed'] = df['optimal_water_needed'].apply(lambda x: max(0, x)) # Ensure non-negative
+
+X = df.drop('optimal_water_needed', axis=1)
+y = df['optimal_water_needed']
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# --- 2. Train XGBoost Model ---
+# Initialize XGBoost Regressor
+xgbr = xgb.XGBRegressor(objective='reg:squarederror',
+                        n_estimators=100,
+                        learning_rate=0.1,
+                        max_depth=5,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
+                        random_state=42)
+
+# Train the model
+logging.info("Starting XGBoost model training...")
+xgbr.fit(X_train, y_train)
+logging.info("XGBoost model training complete.")
+
+# --- 3. Evaluate Model ---
+y_pred = xgbr.predict(X_test)
+rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+logging.info(f"RMSE on test set: {rmse:.2f}")
+
+# --- 4. Save the Model ---
+# For deployment to Azure ML, you typically save the model as a .pkl file
+model_path = 'models/optimal_water_xgboost_model.pkl'
+os.makedirs(os.path.dirname(model_path), exist_ok=True)
+joblib.dump(xgbr, model_path)
+logging.info(f"Model saved to {model_path}")
+
+# In Azure ML, you would then register this model and deploy it as an endpoint.
+# The inference script for the endpoint would load this .pkl file and use it to predict.
