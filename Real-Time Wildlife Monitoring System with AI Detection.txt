@@ -1,0 +1,441 @@
+1. ESP32-CAM Firmware (main.ino - Arduino C++)
+This code snippet outlines the ESP32-CAM's logic. It assumes a PIR sensor triggers capture, and a TFLite Micro model runs on the captured image.
+
+C++
+
+#include "esp_camera.h"
+#include "driver/rtc_io.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include <WiFi.h> // ESP32-CAM uses WiFi libs internally for camera, even if not connecting to internet
+#include <SD_MMC.h> // For SD card logging
+#include <ArduinoJson.h> // For creating JSON payload
+
+// --- LoRa Includes (Conceptual) ---
+// You would need a specific LoRa library like RadioLib or a custom SX127x driver
+// #include <RadioLib.h>
+// SX1276 radio = new Module(SS_PIN, DIO0_PIN, RST_PIN); // Example module pins
+
+// --- Camera Pin Definitions for ESP32-CAM (AI-Thinker model) ---
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// --- PIR Sensor Pin ---
+#define PIR_SENSOR_PIN    13 // Connect PIR output to GPIO 13
+
+// --- LoRa Module Pins (Example, adjust for your specific module) ---
+// #define LORA_SS_PIN       5
+// #define LORA_RST_PIN      14
+// #define LORA_DIO0_PIN     2
+
+// --- Global Variables ---
+RTC_DATA_ATTR int bootCount = 0; // To track reboots from deep sleep
+const int uS_TO_S_FACTOR = 1000000;  // Conversion factor for micro seconds to seconds
+const int TIME_TO_SLEEP_S = 300;     // Time ESP32 will sleep (5 minutes)
+
+// --- TensorFlow Lite Micro (Conceptual) ---
+// These are placeholders. Actual TFLM integration is complex.
+// #include "tensorflow/lite/micro/all_ops_resolver.h"
+// #include "tensorflow/lite/micro/micro_interpreter.h"
+// #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+// #include "tensorflow/lite/schema/schema_generated.h"
+// #include "model.h" // Your converted TFLite model array (e.g., model.h)
+
+// // Globals for TFLite Micro
+// const tflite::Model* model = nullptr;
+// tflite::MicroInterpreter* interpreter = nullptr;
+// TfLiteTensor* input = nullptr;
+// TfLiteTensor* output = nullptr;
+// constexpr int kTensorArenaSize = 100 * 1024; // Adjust based on model size
+// uint8_t tensor_arena[kTensorArenaSize];
+
+// --- Function Prototypes ---
+void initCamera();
+void initPIR();
+void initLoRa(); // Conceptual
+void enterDeepSleep();
+void takePictureAndProcess();
+void saveImageToSD(camera_fb_t *fb);
+void performAIInference(camera_fb_t *fb); // Placeholder for TFLite Micro
+void sendLoRaData(const char* data); // Conceptual
+
+// --- Setup ---
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+
+  // Increment boot counter
+  ++bootCount;
+  Serial.printf("Boot count: %d\n", bootCount);
+
+  // Configure PIR sensor as a wake-up source
+  initPIR();
+
+  // If PIR sensor triggered wake-up, then perform actions
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_TO_PIN(PIR_SENSOR_PIN), HIGH); // Wake on HIGH signal
+
+  // Check wake-up reason
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 || wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+      Serial.println("Woke up from deep sleep. Taking action...");
+      // Re-initialize peripherals after deep sleep
+      initCamera(); // Initialize camera only if waking up to capture
+      // initLoRa(); // Initialize LoRa only if needed
+      takePictureAndProcess();
+      // After processing, go back to sleep
+      enterDeepSleep();
+  } else {
+      Serial.println("Power ON or other wake-up reason. Initializing...");
+      initCamera();
+      // initLoRa();
+      // If no immediate action needed, enter deep sleep
+      enterDeepSleep();
+  }
+}
+
+// --- Loop (empty because we're using deep sleep) ---
+void loop() {
+  // This loop won't run if using deep sleep. All logic is in setup().
+  // If you want to continuously monitor without deep sleep, move logic here.
+}
+
+// --- Function Definitions ---
+
+void initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_siod = SIOD_GPIO_NUM;
+  config.pin_sioc = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG; // Use JPEG for smaller size
+
+  // Adjust for memory constraints and desired resolution
+  config.frame_size = FRAMESIZE_QVGA; // 320x240 for TFLite Micro on ESP32-CAM
+  config.jpeg_quality = 10; // 0-63, lower for better quality (larger file)
+  config.fb_count = 1; // Only one frame buffer to save memory
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+  Serial.println("Camera initialized.");
+
+  // Init SD card
+  if (!SD_MMC.begin()) {
+    Serial.println("SD Card Mount Failed");
+    return;
+  }
+  uint8_t cardType = SD_MMC.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("No SD Card attached");
+    return;
+  }
+  Serial.println("SD Card initialized.");
+
+  // // --- TFLite Micro Model Initialization (Conceptual) ---
+  // // This part is highly dependent on your TFLite Micro model and setup
+  // model = tflite::GetModel(g_model); // g_model is your model array from model.h
+  // if (model->version() != TFLITE_SCHEMA_VERSION) {
+  //   Serial.println("Model provided is schema version is not equal to supported by TF Lite Micro.");
+  //   return;
+  // }
+  // static tflite::MicroMutableOpResolver<10> resolver; // Adjust resolver size based on ops
+  // // Add operations used by your model
+  // resolver.AddDetectionPostprocess(); // Example
+  // resolver.AddConv2D(); // Example
+  // // ... Add all necessary ops for your YOLO/MobileNet model
+
+  // static tflite::MicroInterpreter static_interpreter(model, resolver, tensor_arena, kTensorArenaSize);
+  // interpreter = &static_interpreter;
+  // if (interpreter->AllocateTensors() != kTfLiteOk) {
+  //   Serial.println("AllocateTensors failed.");
+  //   return;
+  // }
+  // input = interpreter->input(0);
+  // output = interpreter->output(0);
+  // Serial.println("TFLite Micro interpreter initialized.");
+}
+
+void initPIR() {
+  pinMode(PIR_SENSOR_PIN, INPUT_PULLDOWN); // Use INPUT_PULLDOWN for a robust state
+  Serial.println("PIR Sensor initialized.");
+}
+
+void initLoRa() {
+  // // Replace with your LoRa module initialization
+  // Serial.print("Initializing LoRa radio...");
+  // int state = radio.begin(868.0, 125.0, 9, 7, 0x12, 10, 0, false); // Example parameters
+  // if (state == RADIOLIB_ERR_NONE) {
+  //   Serial.println("LoRa radio initialized successfully!");
+  // } else {
+  //   Serial.print("LoRa radio initialization failed, code ");
+  //   Serial.println(state);
+  // }
+}
+
+void enterDeepSleep() {
+  Serial.println("Entering deep sleep...");
+  esp_deep_sleep(TIME_TO_SLEEP_S * uS_TO_S_FACTOR);
+  Serial.println("This will not be printed"); // Will not be printed
+}
+
+void takePictureAndProcess() {
+  camera_fb_t *fb = NULL;
+  Serial.println("Taking picture...");
+  fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    return;
+  }
+  Serial.printf("Picture taken! Size: %d bytes\n", fb->len);
+
+  // --- SD Card Logging ---
+  saveImageToSD(fb);
+
+  // --- AI Inference ---
+  performAIInference(fb); // Pass the frame buffer to the AI function
+
+  // Release the frame buffer to free memory
+  esp_camera_fb_return(fb);
+}
+
+void saveImageToSD(camera_fb_t *fb) {
+  if (fb->format != PIXFORMAT_JPEG) {
+    Serial.println("Only JPEG images can be saved to SD.");
+    return;
+  }
+
+  char filename[20];
+  sprintf(filename, "/img_%lu.jpg", millis()); // Unique filename
+
+  File file = SD_MMC.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.println("Failed to open file in writing mode");
+    return;
+  }
+  file.write(fb->buf, fb->len);
+  file.close();
+  Serial.printf("Image saved to SD: %s\n", filename);
+}
+
+void performAIInference(camera_fb_t *fb) {
+  // --- This is a highly conceptual placeholder ---
+  // In a real implementation:
+  // 1. Convert fb->buf (JPEG) to raw pixel data (RGB/Grayscale) compatible with model input.
+  //    This might involve JPEG decoding library (e.g., TJpegDec) and resizing.
+  // 2. Populate 'input' tensor of TFLite Micro interpreter.
+  //    memcpy(input->data.f, processed_pixel_data, input->bytes);
+  // 3. Invoke interpreter.
+  //    if (interpreter->Invoke() != kTfLiteOk) { ... }
+  // 4. Parse 'output' tensor: get bounding boxes, class IDs, confidence scores.
+
+  Serial.println("Performing AI inference on image...");
+  // Simulate AI detection results
+  String detected_species = "Unknown";
+  float confidence = 0.0;
+  bool intrusion = false;
+
+  // Simple simulation based on random chance
+  if (random(100) < 5) { // 5% chance of detecting a rare animal
+    detected_species = "Tiger";
+    confidence = 0.95;
+  } else if (random(100) < 10) { // 10% chance of detecting a common animal
+    detected_species = "Deer";
+    confidence = 0.8;
+  } else if (random(100) < 3) { // 3% chance of detecting human intrusion
+    detected_species = "Human";
+    confidence = 0.99;
+    intrusion = true;
+  }
+
+  Serial.printf("AI Result: %s (Confidence: %.2f), Intrusion: %s\n",
+                detected_species.c_str(), confidence, intrusion ? "Yes" : "No");
+
+  // --- Prepare LoRa payload (metadata and small thumbnail) ---
+  StaticJsonDocument<200> doc;
+  doc["deviceId"] = "wildlife_cam_001"; // Unique ID for this specific camera trap
+  doc["timestamp"] = millis(); // Using millis() for simplicity, would use RTC for real time
+  doc["species"] = detected_species;
+  doc["confidence"] = confidence;
+  doc["intrusion"] = intrusion;
+  // Add location data (pre-configured lat/lon for the node)
+  doc["lat"] = 17.6868; // Example Lat for Visakhapatnam
+  doc["lon"] = 83.2185; // Example Lon for Visakhapatnam
+
+  // Optionally, embed a very small, highly compressed thumbnail (base64 encoded)
+  // This is challenging over LoRa's limited bandwidth and ESP32 RAM.
+  // Better to send metadata and have full images on SD card retrieved later.
+  // char thumbnail_b64[thumbnail_size_b64];
+  // encodeBase64(fb->buf, fb->len, thumbnail_b64);
+  // doc["thumbnail"] = thumbnail_b64;
+
+  char jsonBuffer[200]; // Ensure buffer is large enough for your JSON
+  serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
+  sendLoRaData(jsonBuffer); // Send over LoRa
+}
+
+void sendLoRaData(const char* data) {
+  // --- Conceptual LoRa Transmission ---
+  // Replace with actual LoRa library usage
+  // Serial.print("Sending LoRa packet: ");
+  // Serial.println(data);
+  // int state = radio.startTransmit(data); // Example RadioLib usage
+  // if (state == RADIOLIB_ERR_NONE) {
+  //   Serial.println("LoRa packet sent!");
+  // } else {
+  //   Serial.print("LoRa send failed, code ");
+  //   Serial.println(state);
+  // }
+  // radio.finishTransmit(); // Stop transmitting
+  //
+  Serial.println("Simulating LoRa data send...");
+  Serial.printf("LoRa Payload: %s\n", data);
+  // In a real system, this would actually send over LoRa
+}
+2. AWS Lambda Function (lambda_function.py - Python)
+This AWS Lambda function would be triggered by incoming messages from AWS IoT Core for LoRaWAN (routed via IoT Core Rules to a Lambda action).
+
+Python
+
+import json
+import os
+import boto3
+from datetime import datetime
+
+# Configure logging
+import logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# --- AWS Service Clients ---
+dynamodb = boto3.resource('dynamodb')
+s3 = boto3.client('s3')
+sns = boto3.client('sns') # For sending alerts
+
+# --- AWS Resource Names ---
+METADATA_TABLE_NAME = os.environ.get('METADATA_TABLE_NAME', 'WildlifeDetectionMetadata')
+ALERTS_TOPIC_ARN = os.environ.get('ALERTS_TOPIC_ARN', 'arn:aws:sns:REGION:ACCOUNT_ID:WildlifeAlerts')
+THUMBNAIL_BUCKET_NAME = os.environ.get('THUMBNAIL_BUCKET_NAME', 'your-wildlife-thumbnails-bucket')
+
+def lambda_handler(event, context):
+    logger.info(f"Received event: {json.dumps(event)}")
+
+    try:
+        # Assuming the event payload comes from AWS IoT Core LoRaWAN
+        # The structure might vary based on your IoT Core Rule setup
+        payload_base64 = event['PayloadData'] # LoRaWAN payload data is base64 encoded
+        decoded_payload = base64.b64decode(payload_base64).decode('utf-8')
+        
+        # The ESP32 sends a JSON string via LoRa
+        data = json.loads(decoded_payload)
+
+        device_id = data.get('deviceId')
+        timestamp_ms = data.get('timestamp') # ESP32's millis() timestamp
+        species = data.get('species')
+        confidence = data.get('confidence')
+        intrusion = data.get('intrusion')
+        lat = data.get('lat')
+        lon = data.get('lon')
+        
+        # Convert ESP32 millis() to a proper timestamp (conceptual, better to use RTC on ESP32)
+        event_time = datetime.now().isoformat() + "Z" # Using current lambda execution time as fallback
+
+        # --- Store Metadata in DynamoDB ---
+        table = dynamodb.Table(METADATA_TABLE_NAME)
+        item = {
+            'detectionId': f"{device_id}-{timestamp_ms}", # Unique ID for each detection
+            'deviceId': device_id,
+            'timestamp': event_time,
+            'species': species,
+            'confidence': float(confidence),
+            'intrusion': bool(intrusion),
+            'location': {
+                'latitude': float(lat),
+                'longitude': float(lon)
+            }
+            # 'thumbnailBase64': data.get('thumbnail') # If you manage to send thumbnails via LoRa
+        }
+        table.put_item(Item=item)
+        logger.info(f"Metadata stored in DynamoDB for {device_id}: {species}")
+
+        # --- Handle Thumbnail (if transmitted) and upload to S3 ---
+        # This part assumes you could transmit a small thumbnail in the LoRa payload.
+        # Given LoRa's bandwidth, this is highly constrained (e.g., very small, heavily compressed grayscale).
+        # A more practical approach is to retrieve full images from SD card periodically.
+        # if 'thumbnail' in data and data['thumbnail']:
+        #     thumbnail_bytes = base64.b64decode(data['thumbnail'])
+        #     s3_key = f"thumbnails/{device_id}/{datetime.now().strftime('%Y%m%d%H%M%S')}_{device_id}.jpg"
+        #     s3.put_object(Bucket=THUMBNAIL_BUCKET_NAME, Key=s3_key, Body=thumbnail_bytes, ContentType='image/jpeg')
+        #     logger.info(f"Thumbnail uploaded to S3: {s3_key}")
+        #     # Update DynamoDB item with S3 URL for thumbnail
+        #     table.update_item(
+        #         Key={'detectionId': f"{device_id}-{timestamp_ms}"},
+        #         UpdateExpression="SET thumbnailS3Url = :url",
+        #         ExpressionAttributeValues={':url': f"s3://{THUMBNAIL_BUCKET_NAME}/{s3_key}"}
+        #     )
+
+
+        # --- Trigger Alerts (e.g., for intrusion) ---
+        if intrusion:
+            alert_message = f"INTRUSION ALERT! Human detected by {device_id} at Lat: {lat}, Lon: {lon} on {event_time}"
+            sns.publish(
+                TopicArn=ALERTS_TOPIC_ARN,
+                Message=alert_message,
+                Subject="Wildlife Monitoring Intrusion Alert"
+            )
+            logger.warning(f"Sent intrusion alert: {alert_message}")
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Detection processed successfully!')
+        }
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Payload is not valid JSON: {e} - {event.get('PayloadData', 'N/A')}")
+        return {
+            'statusCode': 400,
+            'body': json.dumps('Invalid JSON payload')
+        }
+    except KeyError as e:
+        logger.error(f"Missing key in payload: {e} - {event.get('PayloadData', 'N/A')}")
+        return {
+            'statusCode': 400,
+            'body': json.dumps('Missing expected data in payload')
+        }
+    except Exception as e:
+        logger.error(f"An error occurred: {e}", exc_info=True)
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Internal server error: {str(e)}')
+        }
